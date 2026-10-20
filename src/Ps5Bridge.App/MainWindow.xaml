@@ -1,0 +1,118 @@
+<Window x:Class="Ps5Bridge.App.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Style="{StaticResource {x:Type Window}}"
+        Title="PS5 Input Bridge" Width="760" Height="800" MinWidth="620" MinHeight="640"
+        MaxHeight="{Binding Source={x:Static SystemParameters.WorkArea}, Path=Height}"
+        WindowStartupLocation="CenterScreen" Loaded="Window_Loaded" Closing="Window_Closing"
+        PreviewKeyDown="Window_PreviewKeyDown">
+    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+        <StackPanel x:Name="MainContent" Margin="28,24">
+            <TextBlock Text="PS5 Input Bridge" FontSize="26" FontWeight="SemiBold" />
+            <TextBlock Text="PC 桥接手柄输入，画面看 PS5 直连电视。" Margin="0,6,0,20"
+                       Foreground="{StaticResource MutedBrush}" />
+
+            <Border Style="{StaticResource Card}">
+                <StackPanel>
+                    <Grid>
+                        <TextBlock Text="账户" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center" />
+                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                            <Button x:Name="ImportBundleButton" Content="导入账户文件" Margin="0,0,8,0"
+                                    Click="ImportBundle_Click" />
+                            <Button x:Name="ExportBundleButton" Content="导出账户文件" Margin="0,0,8,0"
+                                    Click="ExportBundle_Click" />
+                            <Button x:Name="ImportHeliosButton" Content="从 Helios 导入" Margin="0,0,8,0"
+                                    Click="ImportHelios_Click" />
+                            <Button x:Name="AddAccountButton" Content="添加并配对" Click="AddAccount_Click" />
+                        </StackPanel>
+                    </Grid>
+                    <ComboBox x:Name="AccountCombo" Margin="0,14,0,0" SelectionChanged="Account_SelectionChanged">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate>
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBlock Text="{Binding Name}" FontWeight="SemiBold" />
+                                    <TextBlock Text="{Binding Host}" Margin="14,0,0,0" Foreground="{StaticResource MutedBrush}" />
+                                </StackPanel>
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                    </ComboBox>
+                    <TextBlock x:Name="AccountHint" Style="{StaticResource Hint}" Margin="0,9,0,0"
+                               Text="先添加账户并完成一次配对。每个账户单独保存配对凭据。" />
+                    <TextBlock Style="{StaticResource Hint}" Margin="0,5,0,0"
+                               Text="连接时选择另一账户会先断开旧连接。一次只控制一个账户。" />
+                </StackPanel>
+            </Border>
+
+            <Border Style="{StaticResource Card}" Margin="0,14,0,0">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="20" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <StackPanel>
+                        <TextBlock Text="手柄" FontWeight="SemiBold" />
+                        <ComboBox x:Name="ControllerCombo" Margin="0,10,0,0" DisplayMemberPath="DisplayName"
+                                  SelectionChanged="Options_SelectionChanged" />
+                        <TextBlock Style="{StaticResource Hint}" Margin="0,8,0,0" TextWrapping="Wrap"
+                                   Text="XInput（Xbox / PC 模式）按固定间隔采样；DS / PS4 / PS5 模式的手柄走 HID 直读，每个 USB 报告到达即发送，延迟最低，触摸板滑动可用。" />
+                        <TextBlock Text="Back / View 键" FontWeight="SemiBold" Margin="0,14,0,0" />
+                        <ComboBox x:Name="BackMappingCombo" Margin="0,10,0,0" SelectedIndex="0"
+                                  SelectionChanged="BackMapping_SelectionChanged">
+                            <ComboBoxItem Content="触摸板点击（地图 / 记分板）" Tag="0" />
+                            <ComboBoxItem Content="分享 / Create（截图、录屏）" Tag="1" />
+                        </ComboBox>
+                    </StackPanel>
+                    <StackPanel Grid.Column="2">
+                        <TextBlock Text="输入采样间隔" FontWeight="SemiBold" />
+                        <ComboBox x:Name="PollIntervalCombo" Margin="0,10,0,0" SelectedIndex="0"
+                                  SelectionChanged="Options_SelectionChanged">
+                            <ComboBoxItem Content="500 μs（低延迟默认）" Tag="500" />
+                            <ComboBoxItem Content="100 μs 极限（占用一个 CPU 核心）" Tag="100" />
+                            <ComboBoxItem Content="1,000 μs（较低 CPU 占用）" Tag="1000" />
+                        </ComboBox>
+                        <TextBlock Style="{StaticResource Hint}" Margin="0,8,0,0" Text="建议 PC、PS5 和手柄都使用有线连接。" />
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <Border Style="{StaticResource Card}" Margin="0,14,0,0">
+                <StackPanel>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="16" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel VerticalAlignment="Center">
+                            <TextBlock x:Name="StatusText" Text="未连接" FontSize="18" FontWeight="SemiBold" />
+                            <TextBlock x:Name="StatusDetail" Style="{StaticResource Hint}" Margin="0,6,0,0"
+                                       Text="选择账户后点击连接。" HorizontalAlignment="Left" />
+                        </StackPanel>
+                        <StackPanel Grid.Column="2" Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Top">
+                            <Button x:Name="ConnectButton" Content="连接" Style="{StaticResource PrimaryButton}"
+                                    Click="Connect_Click" IsEnabled="False" />
+                            <Button x:Name="DisconnectButton" Content="断开" Margin="8,0,0,0"
+                                    Click="Disconnect_Click" IsEnabled="False" />
+                        </StackPanel>
+                    </Grid>
+                    <Border Height="1" Background="#E6EAF2" Margin="0,16,0,13" />
+                    <TextBlock x:Name="ControllerStatusText" Text="手柄：等待检测" />
+                    <TextBlock x:Name="MetricsText" Text="PC 采集 → 提交：—" Margin="0,7,0,0" />
+                    <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+                        <Button x:Name="PsButton" Content="PS 键" IsEnabled="False" Click="PsButton_Click" />
+                        <Button x:Name="TouchpadButton" Content="触摸板点击" IsEnabled="False"
+                                Margin="8,0,0,0" Click="TouchpadButton_Click" />
+                    </StackPanel>
+                    <TextBlock Style="{StaticResource Hint}" Margin="0,8,0,0"
+                               Text="此统计仅反映 PC 内部输入处理，不代表 PS5 / 电视的完整响应延迟。" />
+                </StackPanel>
+            </Border>
+
+            <TextBlock x:Name="NoticeText" TextWrapping="Wrap" Foreground="#A03D25" Margin="2,12,2,0"
+                       Visibility="Collapsed" />
+            <TextBlock Style="{StaticResource Hint}" Margin="2,16,0,0"
+                       Text="Ctrl + 1…9：切换并连接账户　　Ctrl + D：断开" />
+        </StackPanel>
+    </ScrollViewer>
+</Window>

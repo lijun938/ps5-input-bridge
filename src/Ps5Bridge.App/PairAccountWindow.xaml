@@ -1,0 +1,36 @@
+<Window x:Class="Ps5Bridge.App.PairAccountWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Style="{StaticResource {x:Type Window}}"
+        Title="添加并配对账户" Width="560" SizeToContent="Height" ResizeMode="NoResize"
+        WindowStartupLocation="CenterOwner" Closing="Window_Closing">
+    <StackPanel Margin="26">
+        <TextBlock Text="添加账户" FontSize="23" FontWeight="SemiBold" />
+        <TextBlock Style="{StaticResource Hint}" Margin="0,10,0,18"
+                   Text="在 PS5 登录目标账户，进入 设置 → 系统 → 远程游玩，启用远程游玩并选择关联设备，取得 8 位配对码。" />
+        <StackPanel x:Name="Fields">
+            <TextBlock Text="账户名称（方便自己识别）" />
+            <TextBox x:Name="NameInput" Margin="0,7,0,13" MaxLength="80" />
+            <TextBlock Text="PS5 的局域网 IP 或主机名" />
+            <TextBox x:Name="HostInput" Margin="0,7,0,13" MaxLength="253" />
+            <TextBlock Text="PSN Account-ID（base64）" />
+            <TextBox x:Name="AccountIdInput" Margin="0,7,0,0" MaxLength="32" />
+            <TextBlock Style="{StaticResource Hint}" Margin="0,6,0,13"
+                       Text="需要编码为 base64 的 8 字节账户 ID；不是 PSN 在线名称。" />
+            <TextBlock FontSize="12" Margin="0,-5,0,13">
+                <Hyperlink NavigateUri="https://streetpea.github.io/chiaki-ng/setup/configuration/#registering-your-playstation"
+                           RequestNavigate="AccountIdHelp_RequestNavigate">打开 chiaki-ng 注册指南，获取 Account-ID</Hyperlink>
+            </TextBlock>
+            <TextBlock Text="PS5 上显示的 8 位配对码" />
+            <TextBox x:Name="PinInput" Margin="0,7,0,0" MaxLength="8" />
+        </StackPanel>
+        <TextBlock Style="{StaticResource Hint}" Margin="0,15,0,0"
+                   Text="配对凭据只保存在这台 PC，并使用当前 Windows 用户的密钥加密。无需输入 PSN 密码。" />
+        <TextBlock x:Name="ProgressText" TextWrapping="Wrap" Margin="0,14,0,0" Visibility="Collapsed" />
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,20,0,0">
+            <Button x:Name="CancelButton" Content="取消" IsCancel="True" Click="Cancel_Click" />
+            <Button x:Name="PairButton" Content="配对并保存" IsDefault="True" Margin="8,0,0,0"
+                    Style="{StaticResource PrimaryButton}" Click="Pair_Click" />
+        </StackPanel>
+    </StackPanel>
+</Window>

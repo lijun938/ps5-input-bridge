@@ -1,0 +1,13 @@
+.deps/
+third_party/chiaki/
+**/bin/
+**/obj/
+native/build/
+dist/
+artifacts/
+*.user
+*.log
+__pycache__/
+*.pyc
+/diagnostics/
+/dist.rar
