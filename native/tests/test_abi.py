@@ -19,15 +19,80 @@ class InputDebug(c.Structure):
                 ('observed',c.c_uint64),('failures',c.c_uint64),('l1',c.c_uint64),('r1',c.c_uint64),('chords',c.c_uint64)]
 
 class NativeABI(unittest.TestCase):
+    def test_input_health_snapshot_before_first_read(self):
+        lib = self.open_library()
+        class InputHealth(c.Structure):
+            _fields_ = [('reads', c.c_uint64), ('changes', c.c_uint64), ('failures', c.c_uint64),
+                ('read_age', c.c_double), ('change_age', c.c_double), ('read_duration', c.c_double),
+                ('packet', c.c_uint32), ('error', c.c_uint32),
+                ('lx', c.c_int16), ('ly', c.c_int16), ('rx', c.c_int16), ('ry', c.c_int16),
+                ('buttons', c.c_uint32), ('l2', c.c_uint32), ('r2', c.c_uint32), ('stalls', c.c_uint32)]
+        self.assertEqual(c.sizeof(InputHealth), 80)
+        self.assertTrue(hasattr(lib, 'pb_get_input_health'), 'native DLL must expose input-read health')
+        lib.pb_get_input_health.argtypes = [c.c_void_p, c.POINTER(InputHealth)]
+        ctx = lib.pb_create()
+        try:
+            health = InputHealth()
+            self.assertEqual(lib.pb_get_input_health(ctx, c.byref(health)), 0)
+            self.assertEqual((health.reads, health.changes, health.failures), (0, 0, 0))
+            self.assertEqual(health.stalls, 0)
+            self.assertEqual((health.read_age, health.change_age), (-1, -1))
+            self.assertEqual(lib.pb_get_input_health(None, c.byref(health)), -1)
+            self.assertEqual(lib.pb_get_input_health(ctx, None), -1)
+        finally:
+            lib.pb_destroy(ctx)
+
+    def test_stable_controller_identity_and_independent_status_contract(self):
+        lib = self.open_library()
+        class ControllerStatus(c.Structure):
+            _fields_ = [('state', c.c_uint32), ('error', c.c_uint32)]
+        self.assertEqual(c.sizeof(ControllerStatus), 8)
+        lib.pb_set_controller_device.argtypes = [c.c_void_p, c.c_uint32, c.c_char_p]
+        lib.pb_get_controller_status.argtypes = [c.c_void_p, c.POINTER(ControllerStatus)]
+        lib.pb_start_device.argtypes = [c.c_void_p, c.c_char_p, c.POINTER(Keys), c.c_uint32, c.c_char_p]
+        ctx = lib.pb_create()
+        try:
+            self.assertEqual(lib.pb_set_controller_device(ctx, 4, None), -1)
+            self.assertEqual(lib.pb_set_controller_device(ctx, 4, b''), -1)
+            self.assertEqual(lib.pb_set_controller_device(ctx, 4, b'a'*1536), -1)
+            self.assertEqual(lib.pb_set_controller_device(ctx, 4, b'hid:selected'), 0)
+            self.assertEqual(lib.pb_set_controller_device(ctx, 0, b'hid:selected'), -1)
+            self.assertEqual(lib.pb_set_controller_device(ctx, 0, None), 0)
+            status, controller = Status(), ControllerStatus()
+            self.assertEqual(lib.pb_get_status(ctx, c.byref(status)), 0)
+            self.assertEqual(lib.pb_get_controller_status(ctx, c.byref(controller)), 0)
+            self.assertEqual((status.state, controller.state, controller.error), (0, 0, 0))
+            self.assertEqual(lib.pb_start_device(ctx, b'127.0.0.1', c.byref(Keys()), 4, None), -1)
+        finally:
+            lib.pb_destroy(ctx)
+
+    def test_latency_statistics_contract_and_empty_window(self):
+        lib = self.open_library()
+        class Latency(c.Structure):
+            _fields_ = [('submissions',c.c_uint64),('intervals',c.c_uint64),
+                ('submit_p95',c.c_double),('submit_p99',c.c_double),
+                ('interval_mean',c.c_double),('interval_p95',c.c_double),
+                ('interval_p99',c.c_double),('interval_max',c.c_double),('failures',c.c_uint64)]
+        self.assertEqual(c.sizeof(Latency),72)
+        self.assertTrue(hasattr(lib,'pb_get_latency_stats'))
+        lib.pb_get_latency_stats.argtypes=[c.c_void_p,c.POINTER(Latency)]
+        ctx=lib.pb_create()
+        try:
+            result=Latency()
+            self.assertEqual(lib.pb_get_latency_stats(ctx,c.byref(result)),0)
+            self.assertEqual((result.submissions,result.intervals,result.failures),(0,0,0))
+            self.assertEqual((result.submit_p95,result.submit_p99,result.interval_p95,result.interval_p99),(0,0,0,0))
+        finally:lib.pb_destroy(ctx)
+
     def test_new_diagnostics_and_login_generation_contract(self):
         lib = self.open_library()
-        self.assertEqual(lib.pb_abi_version(), 3)
+        self.assertEqual(lib.pb_abi_version(), 6)
         self.assertEqual(c.sizeof(InputDebug),56)
         self.assertTrue(hasattr(lib,'pb_get_input_debug'),'New input diagnostics are missing')
         self.assertTrue(hasattr(lib,'pb_login_request_serial'),'Login request generations are missing')
         class HidInfo(c.Structure):
-            _fields_=[('vid',c.c_uint16),('pid',c.c_uint16),('layout',c.c_uint32),('name',c.c_char*64)]
-        self.assertEqual(c.sizeof(HidInfo),72)
+            _fields_=[('vid',c.c_uint16),('pid',c.c_uint16),('layout',c.c_uint32),('name',c.c_char*64),('device_id',c.c_char*1536)]
+        self.assertEqual(c.sizeof(HidInfo),1608)
         lib.pb_hid_devices.argtypes=[c.POINTER(HidInfo),c.c_uint32]
         lib.pb_hid_devices.restype=c.c_uint32
         devices=(HidInfo*16)()
@@ -36,6 +101,7 @@ class NativeABI(unittest.TestCase):
         mask=lib.pb_controller_mask()
         for i in range(min(count,16)):
             self.assertIn(devices[i].layout,(1,2))
+            self.assertTrue(devices[i].device_id)
             self.assertTrue(mask & (1<<(4+i)),'Every listed HID pad must appear in the controller mask')
         self.assertEqual(lib.pb_hid_devices(None,0),count,'Capacity 0 must still report the count')
         lib.pb_get_input_debug.argtypes=[c.c_void_p,c.POINTER(InputDebug)]
@@ -67,7 +133,7 @@ class NativeABI(unittest.TestCase):
     def test_bridge_contract_and_lifetime(self):
         lib = self.open_library()
         self.assertEqual((c.sizeof(Keys), c.sizeof(Status), c.sizeof(Timing)), (84,288,24))
-        self.assertEqual(lib.pb_abi_version(),3)
+        self.assertEqual(lib.pb_abi_version(),6)
         self.assertEqual(lib.pb_self_test(),0, 'Native XInput conversion and neutral-release self-test failed')
         for _ in range(20):
             ctx = lib.pb_create()
@@ -172,8 +238,8 @@ class NativeABI(unittest.TestCase):
             lib.pb_get_status(ctx,c.byref(state)); lib.pb_get_timing_stats(ctx,c.byref(timing))
             self.assertEqual(state.state,2, 'The fake console never authenticates; connected must not be reported')
             self.assertGreater(state.samples,1)
-            self.assertGreaterEqual(timing.count,1)
-            self.assertGreaterEqual(timing.max,timing.mean)
+            self.assertEqual(state.reports,0, 'Handshake caching is not a connected submission')
+            self.assertEqual((timing.count,timing.mean,timing.max),(0,0,0))
             started=time.monotonic()
             self.assertEqual(lib.pb_stop(ctx),0)
             self.assertLess(time.monotonic()-started,2)

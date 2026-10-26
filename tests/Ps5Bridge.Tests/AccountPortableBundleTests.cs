@@ -49,4 +49,30 @@ public sealed class AccountPortableBundleTests
         Assert.DoesNotContain(profile.AccountId, text);
         Assert.DoesNotContain("账户一", text);
     }
+
+    [Fact]
+    public void BoundsRejectOversizedFilesExcessAccountsAndExpensiveKdfBeforeDecrypting()
+    {
+        Assert.Throws<InvalidDataException>(() => AccountPortableBundle.Import(new byte[AccountPortableBundle.MaximumFileBytes + 1], "correct horse"));
+        Assert.Throws<ArgumentException>(() => AccountPortableBundle.Export(Enumerable.Range(0, 65).Select(i => Profile($"账户{i}")), "correct horse"));
+        var bundle = AccountPortableBundle.Export([Profile("账户一")], "correct horse");
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(bundle.AsSpan("PS5BRIDGE-PORTABLE"u8.Length), 10_000_000);
+        var error = Assert.Throws<InvalidDataException>(() => AccountPortableBundle.Import(bundle, "correct horse"));
+        Assert.Contains("参数", error.Message);
+    }
+
+    [Fact]
+    public async Task FileImportIsBoundedAndPreservesProfiles()
+    {
+        var path = Path.GetTempFileName();
+        try
+        {
+            var profile = Profile("朋友");
+            await File.WriteAllBytesAsync(path, AccountPortableBundle.Export([profile], "correct horse"));
+            Assert.Equal(profile, Assert.Single(await AccountPortableBundle.ImportFileAsync(path, "correct horse")));
+            await using (var stream = new FileStream(path, FileMode.Create)) stream.SetLength(AccountPortableBundle.MaximumFileBytes + 1L);
+            await Assert.ThrowsAsync<InvalidDataException>(() => AccountPortableBundle.ImportFileAsync(path, "correct horse"));
+        }
+        finally { File.Delete(path); }
+    }
 }

@@ -1,6 +1,6 @@
 """Download pinned, project-local native build tools and source dependencies."""
 from pathlib import Path
-import concurrent.futures, hashlib, shutil, subprocess, sys, tarfile, urllib.request, zipfile
+import concurrent.futures, hashlib, json, shutil, subprocess, sys, tarfile, urllib.request, zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
 DEPS = ROOT / 'native' / '.deps'
@@ -63,6 +63,20 @@ def apply_patches():
             target = CHIAKI / patched.relative_to(PATCHES)
             if not target.exists(): raise RuntimeError(f'Patch target missing: {target}')
             shutil.copyfile(patched, target)
+    # Small checked edits to pinned upstream files; fail closed if the baseline drifts.
+    edits = json.loads((ROOT/'native/patches/chiaki-return-errors.json').read_text(encoding='utf-8'))
+    apply_checked_edits(CHIAKI, edits)
+
+def apply_checked_edits(root, edits):
+    for edit in edits:
+        target = root/edit['file']
+        text = target.read_text(encoding='utf-8')
+        before, after = edit['before'], edit['after']
+        if text.count(after) == 1 and before not in text:
+            continue
+        if text.count(before) != 1 or after in text:
+            raise RuntimeError(f'Pinned upstream patch no longer matches: {edit["file"]}')
+        target.write_text(text.replace(before, after, 1), encoding='utf-8', newline='\n')
 
 def toolchain():
     target = DEPS/'llvm-mingw-20261006-ucrt-x86_64'

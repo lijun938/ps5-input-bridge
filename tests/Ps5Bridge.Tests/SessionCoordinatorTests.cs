@@ -6,6 +6,66 @@ namespace Ps5Bridge.Tests;
 public sealed class SessionCoordinatorTests
 {
     [Fact]
+    public async Task InputSettingsApplyWithoutRestartingTheSession()
+    {
+        var backend = new RecordingBackend();
+        await using var coordinator = new SessionCoordinator(backend);
+        await coordinator.ConnectAsync(AccountStoreTests.Profile("current"), new());
+        var options = new BridgeOptions(4, 100) { DeviceId = "hid:chosen" };
+        await coordinator.UpdateOptionsAsync(options);
+        Assert.Equal(new[] { "start:current", "update" }, backend.Events);
+        Assert.Equal(options, Assert.Single(backend.Updates));
+        Assert.Equal(BridgeState.Connected, coordinator.Status.State);
+    }
+
+    [Fact]
+    public async Task OnlyLatestSettingsWaitingForConnectionAreApplied()
+    {
+        var backend = new RecordingBackend { HoldConnect = true };
+        await using var coordinator = new SessionCoordinator(backend);
+        var connecting = coordinator.ConnectAsync(AccountStoreTests.Profile("current"), new());
+        await backend.Started.Task;
+        var obsolete = coordinator.UpdateOptionsAsync(new(1, 1000));
+        var latest = new BridgeOptions(4, 100) { DeviceId = "hid:latest" };
+        var update = coordinator.UpdateOptionsAsync(latest);
+        Assert.Empty(backend.Updates);
+        backend.ReleaseConnect.TrySetResult();
+        await Task.WhenAll(connecting, obsolete, update);
+        Assert.Equal(latest, Assert.Single(backend.Updates));
+        Assert.Equal(new[] { "start:current", "update" }, backend.Events);
+    }
+
+    [Fact]
+    public async Task SettingsQueuedForOldConnectionCannotReachTheNextAccount()
+    {
+        var backend = new RecordingBackend { HoldConnect = true };
+        await using var coordinator = new SessionCoordinator(backend);
+        var old = coordinator.ConnectAsync(AccountStoreTests.Profile("old"), new());
+        await backend.Started.Task;
+        var update = coordinator.UpdateOptionsAsync(new(1, 100));
+        backend.HoldConnect = false;
+        var next = coordinator.ConnectAsync(AccountStoreTests.Profile("new"), new());
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => old);
+        await Task.WhenAll(update, next);
+        Assert.Empty(backend.Updates);
+        Assert.Equal("new", coordinator.Status.AccountName);
+    }
+
+    [Fact]
+    public async Task InvalidOrCancelledSettingsCannotModifyCurrentSession()
+    {
+        var backend = new RecordingBackend();
+        await using var coordinator = new SessionCoordinator(backend);
+        await coordinator.ConnectAsync(AccountStoreTests.Profile(), new());
+        await Assert.ThrowsAsync<ArgumentException>(() => coordinator.UpdateOptionsAsync(new(0, 250)));
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => coordinator.UpdateOptionsAsync(new(1, 100), cancellation.Token));
+        Assert.Empty(backend.Updates);
+        Assert.True(backend.Active);
+    }
+
+    [Fact]
     public async Task AlreadyCancelledStopCannotCancelTheCurrentConnection()
     {
         var backend = new RecordingBackend { HoldConnect = true };
@@ -157,6 +217,7 @@ public sealed class SessionCoordinatorTests
     private sealed class RecordingBackend : IBridgeBackend
     {
         public List<string> Events { get; } = [];
+        public List<BridgeOptions> Updates { get; } = [];
         public bool FailConnect { get; set; }
         public bool FailStop { get; set; }
         public bool HoldConnect { get; set; }
@@ -166,6 +227,7 @@ public sealed class SessionCoordinatorTests
         public BridgeState? SnapshotState { get; set; }
         public Action? SnapshotReadAction { get; set; }
         public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource ReleaseConnect { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public IReadOnlyList<ControllerInfo> GetControllers() => [new(0, "Test", true)];
         public Task<PairingKeys> PairAsync(string host, string accountId, string pin, CancellationToken token) => throw new NotSupportedException();
         public async Task ConnectAsync(AccountProfile profile, BridgeOptions options, CancellationToken token)
@@ -175,8 +237,15 @@ public sealed class SessionCoordinatorTests
             Active = true;
             MaxConcurrentSessions = Math.Max(MaxConcurrentSessions, 1);
             Started.TrySetResult();
-            if (HoldConnect) await Task.Delay(Timeout.Infinite, token);
+            if (HoldConnect) await ReleaseConnect.Task.WaitAsync(token);
             if (FailConnect) throw new IOException("test failure");
+        }
+        public Task UpdateOptionsAsync(BridgeOptions options, CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+            Events.Add("update");
+            Updates.Add(options);
+            return Task.CompletedTask;
         }
         public Task StopAsync(CancellationToken token)
         {

@@ -1,0 +1,58 @@
+<Window x:Class="Ps5Bridge.App.ChiakiImportWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Style="{StaticResource {x:Type Window}}"
+        Title="从 Chiaki 导入账户" Width="660" Height="610" MinWidth="540" MinHeight="450"
+        MaxHeight="{Binding Source={x:Static SystemParameters.WorkArea}, Path=Height}"
+        WindowStartupLocation="CenterOwner" Loaded="Window_Loaded">
+    <Grid Margin="26">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+        <TextBlock Text="从 Chiaki 导入账户" FontSize="23" FontWeight="SemiBold" />
+        <TextBlock Grid.Row="1" Style="{StaticResource Hint}" Margin="0,10,0,16"
+                   Text="支持桌面版 Chiaki 和 Chiaki-ng 的已配对 PS5。核对下方主机地址；空白时请填写 PS5 的局域网 IP 或主机名，无需重新配对。" />
+        <WrapPanel Grid.Row="2" Margin="0,0,0,12">
+            <Button x:Name="ReadLocalButton" Content="读取本机配置" Click="ReadLocal_Click" Margin="0,0,8,6" />
+            <Button x:Name="ReadFileButton" Content="选择配置文件…" Click="ReadFile_Click" Margin="0,0,0,6" />
+        </WrapPanel>
+        <TextBlock x:Name="SourceText" Grid.Row="3" TextWrapping="Wrap" Margin="0,0,0,12"
+                   Foreground="{StaticResource MutedBrush}" AutomationProperties.LiveSetting="Polite" />
+        <ScrollViewer Grid.Row="4" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+            <ItemsControl x:Name="ProfilesList">
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                        <Border Style="{StaticResource Card}" Margin="0,0,0,10" Padding="15">
+                            <StackPanel>
+                                <TextBlock Text="账户名称（仅用于区分账户）" FontWeight="SemiBold" Margin="0,0,0,5" />
+                                <TextBox Text="{Binding Name, UpdateSourceTrigger=PropertyChanged}" MaxLength="80"
+                                         AutomationProperties.Name="账户名称" />
+                                <TextBlock Text="PS5 的局域网 IP 或主机名" FontSize="12" Margin="0,10,0,5"
+                                           Foreground="{StaticResource MutedBrush}" />
+                                <TextBox Text="{Binding Host, UpdateSourceTrigger=PropertyChanged}" MaxLength="253"
+                                         AutomationProperties.Name="PS5 的局域网 IP 或主机名" />
+                                <TextBlock Style="{StaticResource Hint}" Margin="0,5,0,0"
+                                           Text="例如 192.168.1.50。这里填写地址，改名请使用上面的账户名称。" />
+                            </StackPanel>
+                        </Border>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+        </ScrollViewer>
+        <StackPanel Grid.Row="5" Margin="0,14,0,0">
+            <TextBlock x:Name="ErrorText" Foreground="#A03D25" TextWrapping="Wrap" Visibility="Collapsed" />
+            <TextBlock Style="{StaticResource Hint}" Margin="0,8,0,0"
+                       Text="只读取配对资料，导入后使用本程序现有的加密账户存储。点击取消不会保存。" />
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
+                <Button Content="取消" IsCancel="True" />
+                <Button x:Name="ImportButton" Content="确认导入" IsDefault="True" Margin="8,0,0,0"
+                        IsEnabled="False" Style="{StaticResource PrimaryButton}" Click="Import_Click" />
+            </StackPanel>
+        </StackPanel>
+    </Grid>
+</Window>

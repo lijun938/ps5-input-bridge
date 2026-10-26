@@ -6,6 +6,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>Ps5InputBridge</AssemblyName>
+    <Version>1.0.1</Version>
     <RootNamespace>Ps5Bridge.App</RootNamespace>
     <PlatformTarget>x64</PlatformTarget>
   </PropertyGroup>

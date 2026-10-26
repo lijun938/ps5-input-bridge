@@ -9,6 +9,7 @@ public sealed class SessionCoordinator(IBridgeBackend backend) : IAsyncDisposabl
     private bool hasSession;
     private int disposed;
     private long requestVersion;
+    private long optionsVersion;
     public SessionStatus Status => Volatile.Read(ref status);
     public event Action<SessionStatus>? StatusChanged;
 
@@ -17,8 +18,7 @@ public sealed class SessionCoordinator(IBridgeBackend backend) : IAsyncDisposabl
         ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
         cancellationToken.ThrowIfCancellationRequested();
         AccountStore.Validate(profile);
-        if (options.ControllerIndex is < 0 or >= BridgeOptions.MaxControllers || options.PollIntervalMicroseconds is not (100 or 500 or 1000))
-            throw new ArgumentException($"手柄序号需为 0–{BridgeOptions.MaxControllers - 1}，采集间隔需为 100、500 或 1000 微秒。");
+        ValidateOptions(options);
         var version = Interlocked.Increment(ref requestVersion);
         CancelConnecting();
         await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -68,6 +68,33 @@ public sealed class SessionCoordinator(IBridgeBackend backend) : IAsyncDisposabl
             }
         }
         finally { gate.Release(); }
+    }
+
+    /// <summary>Updates the current session in place. Queued settings belong only to the
+    /// connection that was current when requested; newer settings supersede older ones.</summary>
+    public async Task UpdateOptionsAsync(BridgeOptions options, CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
+        cancellationToken.ThrowIfCancellationRequested();
+        ValidateOptions(options);
+        var sessionVersion = Volatile.Read(ref requestVersion);
+        var updateVersion = Interlocked.Increment(ref optionsVersion);
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
+            if (sessionVersion != Volatile.Read(ref requestVersion) || updateVersion != Volatile.Read(ref optionsVersion)
+                || !hasSession || Status.State != BridgeState.Connected) return;
+            await backend.UpdateOptionsAsync(options, cancellationToken).ConfigureAwait(false);
+        }
+        finally { gate.Release(); }
+    }
+
+    private static void ValidateOptions(BridgeOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        if (options.ControllerIndex is < 0 or >= BridgeOptions.MaxControllers || options.PollIntervalMicroseconds is not (100 or 500 or 1000))
+            throw new ArgumentException($"手柄序号需为 0–{BridgeOptions.MaxControllers - 1}，采集间隔需为 100、500 或 1000 微秒。");
     }
 
     public async Task StopAsync(CancellationToken cancellationToken = default)

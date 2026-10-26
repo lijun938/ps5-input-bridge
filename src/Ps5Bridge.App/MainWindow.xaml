@@ -14,18 +14,7 @@
 
             <Border Style="{StaticResource Card}">
                 <StackPanel>
-                    <Grid>
-                        <TextBlock Text="账户" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center" />
-                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-                            <Button x:Name="ImportBundleButton" Content="导入账户文件" Margin="0,0,8,0"
-                                    Click="ImportBundle_Click" />
-                            <Button x:Name="ExportBundleButton" Content="导出账户文件" Margin="0,0,8,0"
-                                    Click="ExportBundle_Click" />
-                            <Button x:Name="ImportHeliosButton" Content="从 Helios 导入" Margin="0,0,8,0"
-                                    Click="ImportHelios_Click" />
-                            <Button x:Name="AddAccountButton" Content="添加并配对" Click="AddAccount_Click" />
-                        </StackPanel>
-                    </Grid>
+                    <TextBlock Text="账户" FontSize="17" FontWeight="SemiBold" />
                     <ComboBox x:Name="AccountCombo" Margin="0,14,0,0" SelectionChanged="Account_SelectionChanged">
                         <ComboBox.ItemTemplate>
                             <DataTemplate>
@@ -36,6 +25,21 @@
                             </DataTemplate>
                         </ComboBox.ItemTemplate>
                     </ComboBox>
+                    <StackPanel x:Name="AccountActions" Margin="0,10,0,0">
+                        <WrapPanel>
+                            <Button x:Name="EditAccountButton" Content="编辑名称 / 地址" Click="EditAccount_Click" Margin="0,0,8,6" IsEnabled="False" />
+                            <Button x:Name="DeleteAccountButton" Content="删除账户" Click="DeleteAccount_Click" Margin="0,0,0,6" IsEnabled="False" />
+                        </WrapPanel>
+                        <Expander x:Name="AccountTools" Header="导入、导出与添加账户" Margin="0,5,0,0">
+                            <WrapPanel Margin="0,10,0,0">
+                                <Button x:Name="ImportBundleButton" Content="导入账户文件" Margin="0,0,8,6" Click="ImportBundle_Click" />
+                                <Button x:Name="ExportBundleButton" Content="导出账户文件" Margin="0,0,8,6" Click="ExportBundle_Click" />
+                                <Button x:Name="ImportHeliosButton" Content="从 Helios 导入" Margin="0,0,8,6" Click="ImportHelios_Click" />
+                                <Button x:Name="ImportChiakiButton" Content="从 Chiaki 导入" Margin="0,0,8,6" Click="ImportChiaki_Click" />
+                                <Button x:Name="AddAccountButton" Content="添加并配对" Margin="0,0,0,6" Click="AddAccount_Click" />
+                            </WrapPanel>
+                        </Expander>
+                    </StackPanel>
                     <TextBlock x:Name="AccountHint" Style="{StaticResource Hint}" Margin="0,9,0,0"
                                Text="先添加账户并完成一次配对。每个账户单独保存配对凭据。" />
                     <TextBlock Style="{StaticResource Hint}" Margin="0,5,0,0"
@@ -55,7 +59,7 @@
                         <ComboBox x:Name="ControllerCombo" Margin="0,10,0,0" DisplayMemberPath="DisplayName"
                                   SelectionChanged="Options_SelectionChanged" />
                         <TextBlock Style="{StaticResource Hint}" Margin="0,8,0,0" TextWrapping="Wrap"
-                                   Text="XInput（Xbox / PC 模式）按固定间隔采样；DS / PS4 / PS5 模式的手柄走 HID 直读，每个 USB 报告到达即发送，延迟最低，触摸板滑动可用。" />
+                                   Text="XInput（Xbox / PC 模式）按固定间隔采样；DS / PS4 / PS5 模式的手柄走 HID 直读，每个报告到达即处理，触摸板滑动可用。未列出手柄时，请检查 USB / 蓝牙连接和手柄模式。" />
                         <TextBlock Text="Back / View 键" FontWeight="SemiBold" Margin="0,14,0,0" />
                         <ComboBox x:Name="BackMappingCombo" Margin="0,10,0,0" SelectedIndex="0"
                                   SelectionChanged="BackMapping_SelectionChanged">
@@ -71,7 +75,7 @@
                             <ComboBoxItem Content="100 μs 极限（占用一个 CPU 核心）" Tag="100" />
                             <ComboBoxItem Content="1,000 μs（较低 CPU 占用）" Tag="1000" />
                         </ComboBox>
-                        <TextBlock Style="{StaticResource Hint}" Margin="0,8,0,0" Text="建议 PC、PS5 和手柄都使用有线连接。" />
+                        <TextBlock x:Name="PollIntervalHint" Style="{StaticResource Hint}" Margin="0,8,0,0" Text="建议 PC、PS5 和手柄都使用有线连接。" />
                     </StackPanel>
                 </Grid>
             </Border>
@@ -97,13 +101,18 @@
                         </StackPanel>
                     </Grid>
                     <Border Height="1" Background="#E6EAF2" Margin="0,16,0,13" />
-                    <TextBlock x:Name="ControllerStatusText" Text="手柄：等待检测" />
-                    <TextBlock x:Name="MetricsText" Text="PC 采集 → 提交：—" Margin="0,7,0,0" />
+                    <TextBlock x:Name="ControllerStatusText" Text="手柄：等待检测" TextWrapping="Wrap" />
+                    <TextBlock x:Name="MetricsText" Text="PC 采集 → 提交：—" Margin="0,7,0,0" TextWrapping="Wrap" />
+                    <TextBlock x:Name="LatencyText" Text="近期提交 P95 / P99：—" Margin="0,7,0,0" TextWrapping="Wrap" />
+                    <TextBlock x:Name="SamplingText" Text="实际采集间隔：—" Margin="0,7,0,0" TextWrapping="Wrap" />
+                    <TextBlock Style="{StaticResource Hint}" Margin="0,5,0,0"
+                               Text="P95 / P99：近期 95% / 99% 的样本不超过该耗时，用于观察偶发抖动。" />
                     <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
                         <Button x:Name="PsButton" Content="PS 键" IsEnabled="False" Click="PsButton_Click" />
                         <Button x:Name="TouchpadButton" Content="触摸板点击" IsEnabled="False"
                                 Margin="8,0,0,0" Click="TouchpadButton_Click" />
                     </StackPanel>
+                    <Button x:Name="ExportDiagnosticsButton" Content="导出诊断…" HorizontalAlignment="Left" Margin="0,12,0,0" Click="ExportDiagnostics_Click" />
                     <TextBlock Style="{StaticResource Hint}" Margin="0,8,0,0"
                                Text="此统计仅反映 PC 内部输入处理，不代表 PS5 / 电视的完整响应延迟。" />
                 </StackPanel>

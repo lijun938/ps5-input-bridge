@@ -2,7 +2,9 @@
 // Modified by PS5 Input Bridge:
 // - controller changes are encrypted and sent on the caller's thread;
 // - history packets carry each control once with its current value, newest first;
-// - the latest history packet is repeated verbatim shortly after a change to cover UDP loss.
+// - the latest history and stick states are repeated shortly after a change;
+// - unchanged history is refreshed periodically to recover longer UDP loss bursts;
+// - local transport errors remain pending until successfully sent or superseded.
 
 #include <chiaki/feedbacksender.h>
 #include <chiaki/time.h>
@@ -10,10 +12,14 @@
 #include <string.h>
 
 #define FEEDBACK_STATE_TIMEOUT_MAX_US 200000 // maximum time to wait between sending 2 state packets
+#define FEEDBACK_HISTORY_TIMEOUT_MAX_US 200000
 
-/* Upstream carries the new events plus the 4 previous ones. Receivers are
- * expected to apply the newest value per control; folding keeps that result. */
-#define FEEDBACK_HISTORY_EVENTS_PER_PACKET 8
+#define FEEDBACK_ERROR_RETRY_US 8000
+/* Up to 18 controls (at most 3 bytes each) plus four 5-byte touch events.
+ * Never truncate a simultaneous release to the eight most recent controls. */
+_Static_assert(CHIAKI_FEEDBACK_HISTORY_CONTROLS_COUNT * 3
+    + CHIAKI_FEEDBACK_HISTORY_TOUCH_EVENTS_MAX * 5 <= CHIAKI_FEEDBACK_HISTORY_PACKET_BUF_SIZE,
+    "complete control state fits the history payload");
 
 static const uint64_t feedback_resend_delays_us[] = { 2000, 8000, 24000 };
 #define FEEDBACK_RESEND_COUNT (sizeof(feedback_resend_delays_us) / sizeof(feedback_resend_delays_us[0]))
@@ -51,7 +57,12 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_feedback_sender_init(ChiakiFeedbackSender *
 	feedback_sender->history_packet_seq_num = 0;
 	feedback_sender->resend_stage = 0;
 	feedback_sender->resend_due_us = 0;
+	feedback_sender->state_resend_stage = 0;
+	feedback_sender->state_resend_due_us = 0;
+	feedback_sender->state_retry_due_us = feedback_sender->history_retry_due_us = 0;
+	feedback_sender->state_error = feedback_sender->history_error = CHIAKI_ERR_SUCCESS;
 	feedback_sender->last_feedback_state_us = chiaki_time_now_monotonic_us();
+	feedback_sender->last_feedback_history_us = feedback_sender->last_feedback_state_us;
 	feedback_sender->should_stop = false;
 
 	ChiakiErrorCode err = chiaki_mutex_init(&feedback_sender->state_mutex, false);
@@ -109,7 +120,7 @@ static bool controller_state_equals_for_feedback_state(ChiakiControllerState *a,
 	return true;
 }
 
-static void feedback_sender_send_state_locked(ChiakiFeedbackSender *feedback_sender)
+static ChiakiErrorCode feedback_sender_send_state_locked(ChiakiFeedbackSender *feedback_sender)
 {
 	ChiakiControllerState *state = &feedback_sender->controller_state;
 	ChiakiFeedbackState feedback_state;
@@ -132,18 +143,28 @@ static void feedback_sender_send_state_locked(ChiakiFeedbackSender *feedback_sen
 	ChiakiErrorCode err = chiaki_takion_send_feedback_state(feedback_sender->takion, feedback_sender->state_seq_num++, &feedback_state);
 	if(err != CHIAKI_ERR_SUCCESS)
 		CHIAKI_LOGE(feedback_sender->log, "FeedbackSender failed to send Feedback State");
-	feedback_sender->controller_state_prev = *state;
 	feedback_sender->last_feedback_state_us = chiaki_time_now_monotonic_us();
+	feedback_sender->state_error = err;
+	feedback_sender->state_retry_due_us = feedback_sender->last_feedback_state_us + FEEDBACK_ERROR_RETRY_US;
+	if(err == CHIAKI_ERR_SUCCESS)
+		feedback_sender->controller_state_prev = *state;
+	return err;
 }
 
-static void feedback_sender_resend_history_locked(ChiakiFeedbackSender *feedback_sender)
+static ChiakiErrorCode feedback_sender_resend_history_locked(ChiakiFeedbackSender *feedback_sender)
 {
 	if(feedback_sender->history_packet_size == 0)
-		return;
+		return CHIAKI_ERR_SUCCESS;
 	uint8_t buf[CHIAKI_FEEDBACK_HISTORY_PACKET_BUF_SIZE];
 	memcpy(buf, feedback_sender->history_packet, feedback_sender->history_packet_size);
-	chiaki_takion_send_feedback_history(feedback_sender->takion, feedback_sender->history_packet_seq_num,
+	ChiakiErrorCode err = chiaki_takion_send_feedback_history(feedback_sender->takion, feedback_sender->history_packet_seq_num,
 			buf, feedback_sender->history_packet_size);
+	feedback_sender->history_error = err;
+	feedback_sender->last_feedback_history_us = chiaki_time_now_monotonic_us();
+	feedback_sender->history_retry_due_us = feedback_sender->last_feedback_history_us + FEEDBACK_ERROR_RETRY_US;
+	if(err == CHIAKI_ERR_SUCCESS)
+		feedback_sender->controller_state_history_prev = feedback_sender->controller_state;
+	return err;
 }
 
 static void feedback_sender_send_history_locked(ChiakiFeedbackSender *feedback_sender)
@@ -151,8 +172,6 @@ static void feedback_sender_send_history_locked(ChiakiFeedbackSender *feedback_s
 	uint8_t *buf = feedback_sender->history_packet;
 	size_t written = 0;
 	size_t count = feedback_sender->history_recent_len;
-	if(count > FEEDBACK_HISTORY_EVENTS_PER_PACKET)
-		count = FEEDBACK_HISTORY_EVENTS_PER_PACKET;
 	for(size_t i=0; i<feedback_sender->touch_events_len; i++)
 	{
 		ChiakiFeedbackHistoryEvent *event = &feedback_sender->touch_events[i];
@@ -171,7 +190,11 @@ static void feedback_sender_send_history_locked(ChiakiFeedbackSender *feedback_s
 	}
 	feedback_sender->history_packet_size = written;
 	if(written == 0)
+	{
+		feedback_sender->history_error = CHIAKI_ERR_SUCCESS;
+		feedback_sender->resend_stage = 0;
 		return;
+	}
 	feedback_sender->history_packet_seq_num = feedback_sender->history_seq_num++;
 	feedback_sender_resend_history_locked(feedback_sender);
 }
@@ -226,37 +249,70 @@ static bool feedback_sender_record_history(ChiakiFeedbackSender *feedback_sender
 	return changed || feedback_sender->touch_events_len > 0;
 }
 
+static bool controller_history_equals(const ChiakiControllerState *a, const ChiakiControllerState *b)
+{
+	if(a->buttons != b->buttons || a->l2_state != b->l2_state || a->r2_state != b->r2_state)
+		return false;
+	for(size_t i = 0; i < CHIAKI_CONTROLLER_TOUCHES_MAX; i++)
+		if(a->touches[i].id != b->touches[i].id
+			|| (a->touches[i].id >= 0 && (a->touches[i].x != b->touches[i].x || a->touches[i].y != b->touches[i].y)))
+			return false;
+	return true;
+}
+
 CHIAKI_EXPORT ChiakiErrorCode chiaki_feedback_sender_set_controller_state(ChiakiFeedbackSender *feedback_sender, ChiakiControllerState *state)
 {
 	ChiakiErrorCode err = chiaki_mutex_lock(&feedback_sender->state_mutex);
 	if(err != CHIAKI_ERR_SUCCESS)
 		return err;
 
-	if(feedback_sender->should_stop || chiaki_controller_state_equals(&feedback_sender->controller_state, state))
+	if(feedback_sender->should_stop)
 	{
 		chiaki_mutex_unlock(&feedback_sender->state_mutex);
 		return CHIAKI_ERR_SUCCESS;
 	}
 
+	bool state_changed = !controller_state_equals_for_feedback_state(&feedback_sender->controller_state, state);
+	bool history = !controller_history_equals(&feedback_sender->controller_state, state);
 	feedback_sender->controller_state = *state;
-	bool history = feedback_sender_record_history(feedback_sender,
-			&feedback_sender->controller_state_history_prev, &feedback_sender->controller_state);
-	feedback_sender->controller_state_history_prev = feedback_sender->controller_state;
-
-	if(!controller_state_equals_for_feedback_state(&feedback_sender->controller_state, &feedback_sender->controller_state_prev))
+	uint64_t now = chiaki_time_now_monotonic_us();
+	if(state_changed)
+	{
+		feedback_sender_send_state_locked(feedback_sender);
+		feedback_sender->state_resend_stage = 1;
+		feedback_sender->state_resend_due_us = now + feedback_resend_delays_us[0];
+	}
+	else if(feedback_sender->state_error != CHIAKI_ERR_SUCCESS && now >= feedback_sender->state_retry_due_us)
 		feedback_sender_send_state_locked(feedback_sender);
 	if(history)
 	{
+		/* Touch releases are based on the last successful history, so a failed
+		 * release survives a later button change. Identical retries reuse the packet. */
+		feedback_sender_record_history(feedback_sender, &feedback_sender->controller_state_history_prev, state);
 		feedback_sender_send_history_locked(feedback_sender);
-		feedback_sender->resend_stage = 1;
-		feedback_sender->resend_due_us = chiaki_time_now_monotonic_us() + feedback_resend_delays_us[0];
+		feedback_sender->resend_stage = feedback_sender->history_packet_size ? 1 : 0;
+		feedback_sender->resend_due_us = now + feedback_resend_delays_us[0];
 	}
+	else if(feedback_sender->history_error != CHIAKI_ERR_SUCCESS && now >= feedback_sender->history_retry_due_us)
+		feedback_sender_resend_history_locked(feedback_sender);
 
+	err = feedback_sender->state_error != CHIAKI_ERR_SUCCESS ? feedback_sender->state_error : feedback_sender->history_error;
 	chiaki_mutex_unlock(&feedback_sender->state_mutex);
-	if(history)
+	if(history || state_changed)
 		chiaki_cond_signal(&feedback_sender->state_cond);
 
-	return CHIAKI_ERR_SUCCESS;
+	return err;
+}
+
+static void advance_resend(unsigned *stage, uint64_t *due, uint64_t now)
+{
+	if(*stage < FEEDBACK_RESEND_COUNT)
+	{
+		/* Do not burst several delayed repeats after a scheduling stall. */
+		*due = now + feedback_resend_delays_us[*stage] - feedback_resend_delays_us[*stage - 1];
+		(*stage)++;
+	}
+	else *stage = 0;
 }
 
 static void *feedback_sender_thread_func(void *user)
@@ -272,8 +328,17 @@ static void *feedback_sender_thread_func(void *user)
 	{
 		uint64_t now_us = chiaki_time_now_monotonic_us();
 		uint64_t next_us = feedback_sender->last_feedback_state_us + FEEDBACK_STATE_TIMEOUT_MAX_US;
+		uint64_t history_keepalive_us = feedback_sender->last_feedback_history_us + FEEDBACK_HISTORY_TIMEOUT_MAX_US;
+		if(feedback_sender->history_packet_size && history_keepalive_us < next_us)
+			next_us = history_keepalive_us;
 		if(feedback_sender->resend_stage && feedback_sender->resend_due_us < next_us)
 			next_us = feedback_sender->resend_due_us;
+		if(feedback_sender->state_resend_stage && feedback_sender->state_resend_due_us < next_us)
+			next_us = feedback_sender->state_resend_due_us;
+		if(feedback_sender->state_error != CHIAKI_ERR_SUCCESS && feedback_sender->state_retry_due_us < next_us)
+			next_us = feedback_sender->state_retry_due_us;
+		if(feedback_sender->history_error != CHIAKI_ERR_SUCCESS && feedback_sender->history_retry_due_us < next_us)
+			next_us = feedback_sender->history_retry_due_us;
 		if(now_us < next_us)
 		{
 			err = chiaki_cond_timedwait(&feedback_sender->state_cond, &feedback_sender->state_mutex,
@@ -283,26 +348,28 @@ static void *feedback_sender_thread_func(void *user)
 			continue;
 		}
 
-		if(feedback_sender->resend_stage && feedback_sender->resend_due_us <= now_us)
+		bool history_due = feedback_sender->resend_stage && feedback_sender->resend_due_us <= now_us;
+		if(history_due || (feedback_sender->history_error != CHIAKI_ERR_SUCCESS && feedback_sender->history_retry_due_us <= now_us)
+				|| (feedback_sender->history_packet_size && history_keepalive_us <= now_us))
 		{
 			feedback_sender_resend_history_locked(feedback_sender);
-			unsigned stage = feedback_sender->resend_stage;
-			if(stage < FEEDBACK_RESEND_COUNT)
-			{
-				feedback_sender->resend_due_us += feedback_resend_delays_us[stage] - feedback_resend_delays_us[stage - 1];
-				feedback_sender->resend_stage = stage + 1;
-			}
-			else
-				feedback_sender->resend_stage = 0;
+			if(history_due) advance_resend(&feedback_sender->resend_stage, &feedback_sender->resend_due_us, now_us);
 		}
-		if(now_us >= feedback_sender->last_feedback_state_us + FEEDBACK_STATE_TIMEOUT_MAX_US)
+		bool state_due = feedback_sender->state_resend_stage && feedback_sender->state_resend_due_us <= now_us;
+		if(state_due || (feedback_sender->state_error != CHIAKI_ERR_SUCCESS && feedback_sender->state_retry_due_us <= now_us)
+				|| now_us >= feedback_sender->last_feedback_state_us + FEEDBACK_STATE_TIMEOUT_MAX_US)
+		{
 			feedback_sender_send_state_locked(feedback_sender);
+			if(state_due) advance_resend(&feedback_sender->state_resend_stage, &feedback_sender->state_resend_due_us, now_us);
+		}
 	}
 
 	/* The final state (usually all released) was sent by the caller; repeat it
 	 * once so a single lost datagram cannot leave a control held. */
-	if(feedback_sender->resend_stage)
+	if(feedback_sender->resend_stage || feedback_sender->history_error != CHIAKI_ERR_SUCCESS)
 		feedback_sender_resend_history_locked(feedback_sender);
+	if(feedback_sender->state_resend_stage || feedback_sender->state_error != CHIAKI_ERR_SUCCESS)
+		feedback_sender_send_state_locked(feedback_sender);
 	chiaki_mutex_unlock(&feedback_sender->state_mutex);
 
 	return NULL;

@@ -20,9 +20,16 @@ static CRITICAL_SECTION capture_lock;
 static CapturedPacket packets[4096];
 static size_t packet_count;
 static unsigned drop_next;
+static uint64_t history_drop_until_us;
 static int received_sequence_valid;
 static ChiakiSeqNum16 received_sequence;
 static int held[256];
+static unsigned state_drop_next, state_count, history_attempts;
+static int fail_history, fail_state;
+static int received_state_valid;
+static ChiakiSeqNum16 received_state_sequence;
+static ChiakiFeedbackState received_state;
+static int touch_held[128];
 
 static size_t event_length(const uint8_t *p, size_t remaining) {
     if(p[0] == 0x80 && remaining >= 2) {
@@ -67,16 +74,29 @@ static int controls_unique(const uint8_t *payload, size_t size, size_t *count) {
 
 ChiakiErrorCode chiaki_takion_send_feedback_state(ChiakiTakion *takion,
         ChiakiSeqNum16 sequence, ChiakiFeedbackState *state) {
-    (void)takion; (void)sequence; (void)state;
-    return CHIAKI_ERR_SUCCESS;
+    (void)takion;
+    EnterCriticalSection(&capture_lock);
+    state_count++;
+    int failed = fail_state;
+    int dropped = state_drop_next > 0;
+    if(dropped) state_drop_next--;
+    if(!failed && !dropped && (!received_state_valid || chiaki_seq_num_16_gt(sequence, received_state_sequence))) {
+        received_state_valid = 1;
+        received_state_sequence = sequence;
+        received_state = *state;
+    }
+    LeaveCriticalSection(&capture_lock);
+    return failed ? CHIAKI_ERR_NETWORK : CHIAKI_ERR_SUCCESS;
 }
 
 ChiakiErrorCode chiaki_takion_send_feedback_history(ChiakiTakion *takion,
         ChiakiSeqNum16 sequence, uint8_t *payload, size_t size) {
     (void)takion;
     EnterCriticalSection(&capture_lock);
-    int dropped = drop_next > 0;
-    if(dropped) drop_next--;
+    history_attempts++;
+    if(fail_history) { LeaveCriticalSection(&capture_lock); return CHIAKI_ERR_NETWORK; }
+    int dropped = drop_next > 0 || chiaki_time_now_monotonic_us() < history_drop_until_us;
+    if(drop_next > 0) drop_next--;
     if(packet_count < sizeof(packets) / sizeof(packets[0])) {
         CapturedPacket *packet = &packets[packet_count++];
         packet->sequence = sequence;
@@ -98,6 +118,8 @@ ChiakiErrorCode chiaki_takion_send_feedback_history(ChiakiTakion *takion,
                 else if(id >= 0xac) held[id - 0x20] = 0xff;
                 else held[id] = 0;
             }
+            else if(payload[p] == 0xc0 || payload[p] == 0xd0)
+                touch_held[payload[p + 1] & 0x7f] = payload[p] == 0xd0;
             p += length;
         }
     }
@@ -109,8 +131,13 @@ static void reset_capture(void) {
     EnterCriticalSection(&capture_lock);
     packet_count = 0;
     drop_next = 0;
+    history_drop_until_us = 0;
     received_sequence_valid = 0;
     memset(held, 0, sizeof(held));
+    state_drop_next = state_count = history_attempts = 0;
+    fail_history = fail_state = received_state_valid = 0;
+    memset(&received_state, 0, sizeof(received_state));
+    memset(touch_held, 0, sizeof(touch_held));
     LeaveCriticalSection(&capture_lock);
 }
 
@@ -200,14 +227,70 @@ static int lost_release_recovered(void) {
     return recovered && recovered_us < 6000 && verbatim;
 }
 
+/* All fast repeats fall inside a UDP loss burst. A quiet button/trigger release
+ * must still recover, including when stick changes keep the state stream busy. */
+static int burst_lost_release_recovered(int moving_stick) {
+    reset_capture();
+    ChiakiFeedbackSender sender; ChiakiTakion takion; ChiakiLog log;
+    if(!init_sender(&sender, &takion, &log)) return 0;
+    ChiakiControllerState state;
+    chiaki_controller_state_set_idle(&state);
+    state.buttons = CHIAKI_CONTROLLER_BUTTON_BOX;
+    state.l2_state = 255;
+    chiaki_feedback_sender_set_controller_state(&sender, &state);
+    Sleep(40);
+    uint64_t start = chiaki_time_now_monotonic_us();
+    EnterCriticalSection(&capture_lock);
+    size_t release_index = packet_count;
+    history_drop_until_us = start + 100000;
+    LeaveCriticalSection(&capture_lock);
+    chiaki_controller_state_set_idle(&state);
+    chiaki_feedback_sender_set_controller_state(&sender, &state);
+    int seen_held_during_loss = 0;
+    while(chiaki_time_now_monotonic_us() - start < 600000) {
+        if(moving_stick) {
+            state.left_x = state.left_x ? 0 : 12000;
+            chiaki_feedback_sender_set_controller_state(&sender, &state);
+        }
+        EnterCriticalSection(&capture_lock);
+        if(chiaki_time_now_monotonic_us() - start < 100000)
+            seen_held_during_loss |= held[0x8a] == 255 && held[0x86] == 255;
+        LeaveCriticalSection(&capture_lock);
+        Sleep(1);
+    }
+    chiaki_feedback_sender_fini(&sender);
+    int recovered = held[0x8a] == 0 && held[0x86] == 0;
+    size_t release_attempts = packet_count - release_index;
+    int bounded = release_attempts >= 5 && release_attempts <= 8;
+    int verbatim = release_attempts > 4 && packets[release_index].dropped;
+    for(size_t i = release_index + 1; i < packet_count && verbatim; i++)
+        verbatim = packets[i].sequence == packets[release_index].sequence
+            && packets[i].size == packets[release_index].size
+            && !memcmp(packets[i].payload, packets[release_index].payload, packets[i].size);
+    printf("100 ms UDP loss burst (%s): held-during-loss=%d release-recovered=%d verbatim=%d attempts=%zu bounded=%d\n",
+        moving_stick ? "moving stick" : "idle", seen_held_during_loss, recovered, verbatim,
+        release_attempts, bounded);
+    return seen_held_during_loss && recovered && verbatim && bounded;
+}
+
 static int all_controls_release(void) {
     reset_capture();
     ChiakiFeedbackSender sender; ChiakiTakion takion; ChiakiLog log;
     if(!init_sender(&sender, &takion, &log)) return 0;
     ChiakiControllerState state;
     chiaki_controller_state_set_idle(&state);
-    state.buttons = 0xffff; state.l2_state = state.r2_state = 255;
+    for(unsigned i = 0; i < CHIAKI_CONTROLLER_BUTTONS_COUNT; i++) {
+        state.buttons |= 1u << i;
+        chiaki_feedback_sender_set_controller_state(&sender, &state);
+    }
+    state.l2_state = 255;
     chiaki_feedback_sender_set_controller_state(&sender, &state);
+    state.r2_state = 255;
+    chiaki_feedback_sender_set_controller_state(&sender, &state);
+    int pressed = 0;
+    EnterCriticalSection(&capture_lock);
+    for(unsigned i = 0; i < 256; i++) pressed += held[i] != 0;
+    LeaveCriticalSection(&capture_lock);
     chiaki_controller_state_set_idle(&state);
     chiaki_feedback_sender_set_controller_state(&sender, &state);
     /* Shutdown immediately after the release must still repeat it. */
@@ -216,9 +299,176 @@ static int all_controls_release(void) {
     for(uint8_t id = 0x80; id <= 0x91; id++) released &= held[id] == 0;
     int last_is_release = packet_count >= 3
         && packets[packet_count - 1].sequence == packets[packet_count - 2].sequence;
-    printf("18 controls pressed + released + immediate shutdown: released=%d repeated-on-stop=%d packets=%zu\n",
-        released, last_is_release, packet_count);
-    return released && last_is_release;
+    printf("18 controls individually pressed + released: pressed=%d released=%d repeated-on-stop=%d\n",
+        pressed, released, last_is_release);
+    return pressed == 18 && released && last_is_release;
+}
+
+static int state_recovered(short expected, unsigned timeout_ms) {
+    uint64_t start = chiaki_time_now_monotonic_us();
+    do {
+        EnterCriticalSection(&capture_lock);
+        int ok = received_state_valid && received_state.left_x == expected;
+        LeaveCriticalSection(&capture_lock);
+        if(ok) return 1;
+        Sleep(1);
+    } while(chiaki_time_now_monotonic_us() - start < timeout_ms * 1000ULL);
+    return 0;
+}
+
+static int lost_stick_stop_recovered(void) {
+    reset_capture();
+    ChiakiFeedbackSender sender; ChiakiTakion takion; ChiakiLog log;
+    if(!init_sender(&sender, &takion, &log)) return 0;
+    ChiakiControllerState state;
+    chiaki_controller_state_set_idle(&state);
+    state.left_x = 12345;
+    chiaki_feedback_sender_set_controller_state(&sender, &state);
+    Sleep(40);
+    EnterCriticalSection(&capture_lock); state_drop_next = 1; LeaveCriticalSection(&capture_lock);
+    state.left_x = 0;
+    uint64_t start = chiaki_time_now_monotonic_us();
+    chiaki_feedback_sender_set_controller_state(&sender, &state);
+    int recovered = state_recovered(0, 70);
+    double elapsed = (chiaki_time_now_monotonic_us() - start) / 1000.0;
+    chiaki_feedback_sender_fini(&sender);
+    printf("lost stick stop: recovered=%d after %.1f ms (before 200 ms keepalive)\n", recovered, elapsed);
+    return recovered;
+}
+
+static int local_errors_retry_unchanged_input(void) {
+    reset_capture();
+    ChiakiFeedbackSender sender; ChiakiTakion takion; ChiakiLog log;
+    if(!init_sender(&sender, &takion, &log)) return 0;
+    ChiakiControllerState state;
+    chiaki_controller_state_set_idle(&state);
+    state.left_x = 15000; state.buttons = CHIAKI_CONTROLLER_BUTTON_BOX;
+    EnterCriticalSection(&capture_lock); fail_state = fail_history = 1; LeaveCriticalSection(&capture_lock);
+    int error = chiaki_feedback_sender_set_controller_state(&sender, &state) == CHIAKI_ERR_NETWORK;
+    Sleep(45); /* Recovery must still work after all three loss-recovery repeats. */
+    EnterCriticalSection(&capture_lock);
+    int bounded = state_count >= 4 && state_count <= 16 && history_attempts >= 4 && history_attempts <= 16;
+    fail_state = fail_history = 0;
+    LeaveCriticalSection(&capture_lock);
+    int recovered = state_recovered(15000, 70);
+    uint64_t start = chiaki_time_now_monotonic_us();
+    int history = 0;
+    do {
+        EnterCriticalSection(&capture_lock); history = held[0x8a] == 255; LeaveCriticalSection(&capture_lock);
+        if(history) break;
+        Sleep(1);
+    } while(chiaki_time_now_monotonic_us() - start < 70000);
+    chiaki_feedback_sender_fini(&sender);
+    printf("local send errors: propagated=%d unchanged state recovered=%d history recovered=%d retries bounded=%d\n", error, recovered, history, bounded);
+    return error && recovered && history && bounded;
+}
+
+static int partial_failure_keeps_latest_input(void) {
+    int ok = 1;
+    for(int state_fails = 0; state_fails <= 1; state_fails++) {
+        reset_capture();
+        ChiakiFeedbackSender sender; ChiakiTakion takion; ChiakiLog log;
+        if(!init_sender(&sender, &takion, &log)) return 0;
+        ChiakiControllerState state;
+        chiaki_controller_state_set_idle(&state);
+        state.left_x = 7000; state.buttons = CHIAKI_CONTROLLER_BUTTON_BOX;
+        chiaki_feedback_sender_set_controller_state(&sender, &state);
+        EnterCriticalSection(&capture_lock);
+        fail_state = state_fails; fail_history = !state_fails;
+        LeaveCriticalSection(&capture_lock);
+        state.left_x = 0; state.buttons = 0;
+        ok &= chiaki_feedback_sender_set_controller_state(&sender, &state) == CHIAKI_ERR_NETWORK;
+        EnterCriticalSection(&capture_lock);
+        ok &= received_state.left_x == (state_fails ? 7000 : 0) && held[0x8a] == (state_fails ? 0 : 255);
+        LeaveCriticalSection(&capture_lock);
+        state.left_x = 12000; state.buttons = CHIAKI_CONTROLLER_BUTTON_BOX;
+        ok &= chiaki_feedback_sender_set_controller_state(&sender, &state) == CHIAKI_ERR_NETWORK;
+        EnterCriticalSection(&capture_lock); fail_state = fail_history = 0; LeaveCriticalSection(&capture_lock);
+        ok &= state_recovered(12000, 70);
+        Sleep(40);
+        ok &= chiaki_feedback_sender_set_controller_state(&sender, &state) == CHIAKI_ERR_SUCCESS;
+        chiaki_feedback_sender_fini(&sender);
+        ok &= received_state.left_x == 12000 && held[0x8a] == 255;
+    }
+    printf("independent state/history failure preserves latest input: %d\n", ok);
+    return ok;
+}
+
+static int unchanged_input_stops_repeating(void) {
+    reset_capture();
+    ChiakiFeedbackSender sender; ChiakiTakion takion; ChiakiLog log;
+    if(!init_sender(&sender, &takion, &log)) return 0;
+    ChiakiControllerState state;
+    chiaki_controller_state_set_idle(&state);
+    state.left_x = 1000; state.buttons = CHIAKI_CONTROLLER_BUTTON_BOX;
+    chiaki_feedback_sender_set_controller_state(&sender, &state);
+    Sleep(80);
+    for(int i = 0; i < 100; i++) chiaki_feedback_sender_set_controller_state(&sender, &state);
+    chiaki_feedback_sender_fini(&sender);
+    int ok = state_count == 4 && packet_count == 4;
+    printf("unchanged input has only initial + three repeats: state=%u history=%zu\n", state_count, packet_count);
+    return ok;
+}
+
+static int shutdown_repeats_final_neutral(void) {
+    reset_capture();
+    ChiakiFeedbackSender sender; ChiakiTakion takion; ChiakiLog log;
+    if(!init_sender(&sender, &takion, &log)) return 0;
+    ChiakiControllerState state;
+    chiaki_controller_state_set_idle(&state);
+    state.left_x = 9000; state.buttons = CHIAKI_CONTROLLER_BUTTON_BOX;
+    chiaki_feedback_sender_set_controller_state(&sender, &state);
+    EnterCriticalSection(&capture_lock); state_drop_next = drop_next = 1; LeaveCriticalSection(&capture_lock);
+    chiaki_controller_state_set_idle(&state);
+    chiaki_feedback_sender_set_controller_state(&sender, &state);
+    chiaki_feedback_sender_fini(&sender);
+    int ok = received_state.left_x == 0 && held[0x8a] == 0;
+    printf("shutdown repeats dropped final stick/button neutral: %d\n", ok);
+    return ok;
+}
+
+static int newest_state_supersedes_failed_state(void) {
+    reset_capture();
+    ChiakiFeedbackSender sender; ChiakiTakion takion; ChiakiLog log;
+    if(!init_sender(&sender, &takion, &log)) return 0;
+    chiaki_mutex_lock(&sender.state_mutex);
+    sender.state_seq_num = 65535;
+    chiaki_mutex_unlock(&sender.state_mutex);
+    ChiakiControllerState state;
+    chiaki_controller_state_set_idle(&state);
+    state.left_x = 7000;
+    chiaki_feedback_sender_set_controller_state(&sender, &state);
+    EnterCriticalSection(&capture_lock); fail_state = 1; LeaveCriticalSection(&capture_lock);
+    state.left_x = -12000;
+    chiaki_feedback_sender_set_controller_state(&sender, &state);
+    state.left_x = 0;
+    chiaki_feedback_sender_set_controller_state(&sender, &state);
+    EnterCriticalSection(&capture_lock); fail_state = 0; LeaveCriticalSection(&capture_lock);
+    int recovered = state_recovered(0, 70);
+    Sleep(40);
+    EnterCriticalSection(&capture_lock); int stayed = received_state.left_x == 0; LeaveCriticalSection(&capture_lock);
+    chiaki_feedback_sender_fini(&sender);
+    printf("latest state replaces failed state across sequence wrap: recovered=%d stayed=%d\n", recovered, stayed);
+    return recovered && stayed;
+}
+
+static int failed_touch_release_survives_button_change(void) {
+    reset_capture();
+    ChiakiFeedbackSender sender; ChiakiTakion takion; ChiakiLog log;
+    if(!init_sender(&sender, &takion, &log)) return 0;
+    ChiakiControllerState state;
+    chiaki_controller_state_set_idle(&state);
+    state.touches[0].id = 1; state.touches[0].x = 100; state.touches[0].y = 200;
+    chiaki_feedback_sender_set_controller_state(&sender, &state);
+    EnterCriticalSection(&capture_lock); int down = touch_held[1]; fail_history = 1; LeaveCriticalSection(&capture_lock);
+    state.touches[0].id = -1;
+    int error = chiaki_feedback_sender_set_controller_state(&sender, &state) == CHIAKI_ERR_NETWORK;
+    EnterCriticalSection(&capture_lock); fail_history = 0; LeaveCriticalSection(&capture_lock);
+    state.buttons = CHIAKI_CONTROLLER_BUTTON_BOX;
+    chiaki_feedback_sender_set_controller_state(&sender, &state);
+    chiaki_feedback_sender_fini(&sender);
+    printf("failed touch release + new button: down=%d error=%d released=%d\n", down, error, !touch_held[1]);
+    return down && error && !touch_held[1] && held[0x8a] == 255;
 }
 
 static int fast_shoulder_combo(void) {
@@ -251,9 +501,19 @@ int main(void) {
     int passed = 0;
     passed += reload_during_trigger_sweep();
     passed += lost_release_recovered();
+    passed += burst_lost_release_recovered(0);
+    passed += burst_lost_release_recovered(1);
     passed += all_controls_release();
     passed += fast_shoulder_combo();
+    passed += lost_stick_stop_recovered();
+    passed += local_errors_retry_unchanged_input();
+    passed += newest_state_supersedes_failed_state();
+    passed += failed_touch_release_survives_button_change();
+    passed += partial_failure_keeps_latest_input();
+    passed += unchanged_input_stops_repeating();
+    passed += shutdown_repeats_final_neutral();
     DeleteCriticalSection(&capture_lock);
-    printf("Feedback sender regressions: %d/4 passed (transport/receiver model, no PS5).\n", passed);
-    return passed == 4 ? 0 : 1;
+    timeEndPeriod(1);
+    printf("Feedback sender regressions: %d/13 passed (transport/receiver model, no PS5).\n", passed);
+    return passed == 13 ? 0 : 1;
 }

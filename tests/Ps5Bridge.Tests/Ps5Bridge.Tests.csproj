@@ -16,6 +16,7 @@
     <ProjectReference Include="../../src/Ps5Bridge.Core/Ps5Bridge.Core.csproj" />
     <Compile Include="../../src/Ps5Bridge.App/WindowsSecretProtector.cs" Link="WindowsSecretProtector.cs" />
     <Compile Include="../../src/Ps5Bridge.App/NativeBridgeBackend.cs" Link="NativeBridgeBackend.cs" />
+    <Compile Include="../../src/Ps5Bridge.App/ChiakiSettingsReader.cs" Link="ChiakiSettingsReader.cs" />
     <None Include="../../native/out/ps5bridge.dll" Link="ps5bridge.dll" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

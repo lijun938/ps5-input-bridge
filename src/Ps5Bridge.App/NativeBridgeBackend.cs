@@ -38,7 +38,8 @@ public sealed class NativeBridgeBackend : IBridgeBackend
             var name = Decode(devices[i].Name);
             var layout = devices[i].Layout == 2 ? "DualSense" : "DualShock 4";
             list.Add(new ControllerInfo(XInputSlots + i,
-                $"HID 直读 · {(name.Length > 0 ? name : $"{devices[i].VendorId:X4}:{devices[i].ProductId:X4}")}（{layout} 模式）", true));
+                $"HID 直读 · {(name.Length > 0 ? name : $"{devices[i].VendorId:X4}:{devices[i].ProductId:X4}")}（{layout} 模式）", true)
+                { DeviceId = Decode(devices[i].DeviceId) });
         }
         return list;
     }
@@ -95,6 +96,7 @@ public sealed class NativeBridgeBackend : IBridgeBackend
     public async Task ConnectAsync(AccountProfile profile, BridgeOptions options, CancellationToken cancellationToken)
     {
         AccountStore.Validate(profile);
+        RequireHidIdentity(options);
         await lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -115,8 +117,8 @@ public sealed class NativeBridgeBackend : IBridgeBackend
             ThrowIfFailed(Native.pb_set_poll_interval(handle, checked((uint)options.PollIntervalMicroseconds)), handle, "采集间隔设置失败");
             ThrowIfFailed(Native.pb_set_back_mapping(handle, BackMapping), handle, "Back 键映射设置失败");
             cancellationToken.ThrowIfCancellationRequested();
-            var code = await Task.Run(() => Native.pb_start(handle, profile.Host, ref credentials,
-                checked((uint)options.ControllerIndex)), CancellationToken.None).ConfigureAwait(false);
+            var code = await Task.Run(() => Native.pb_start_device(handle, profile.Host, ref credentials,
+                checked((uint)options.ControllerIndex), options.DeviceId), CancellationToken.None).ConfigureAwait(false);
             ThrowIfFailed(code, handle, "无法开始连接");
             await WaitForConnectionAsync(() =>
             {
@@ -135,6 +137,35 @@ public sealed class NativeBridgeBackend : IBridgeBackend
             throw;
         }
         finally { lifecycle.Release(); }
+    }
+
+    public async Task UpdateOptionsAsync(BridgeOptions options, CancellationToken cancellationToken)
+    {
+        if (options.ControllerIndex is < 0 or >= BridgeOptions.MaxControllers || options.PollIntervalMicroseconds is not (100 or 500 or 1000))
+            throw new ArgumentException("请选择有效手柄和 100、500 或 1000 微秒采集间隔。");
+        RequireHidIdentity(options);
+        await lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            CheckDisposed();
+            if (context is not { IsClosed: false } handle) return;
+            ThrowIfFailed(Native.pb_get_status(handle, out var status), handle, "状态读取失败");
+            if (status.State != 3) return;
+            cancellationToken.ThrowIfCancellationRequested();
+            ThrowIfFailed(Native.pb_set_controller_device(handle, checked((uint)options.ControllerIndex), options.DeviceId),
+                handle, "手柄设置失败");
+            ThrowIfFailed(Native.pb_set_poll_interval(handle, checked((uint)options.PollIntervalMicroseconds)),
+                handle, "采集间隔设置失败");
+        }
+        finally { lifecycle.Release(); }
+    }
+
+    private static void RequireHidIdentity(BridgeOptions options)
+    {
+        if (options.ControllerIndex is >= XInputSlots and < BridgeOptions.MaxControllers && string.IsNullOrWhiteSpace(options.DeviceId))
+            throw new IOException("所选 HID 手柄缺少设备标识，请刷新手柄列表并重新选择。");
+        if (options.DeviceId is not null && Encoding.UTF8.GetByteCount(options.DeviceId) >= 1536)
+            throw new ArgumentException("手柄设备标识过长，请刷新列表并重新选择。");
     }
 
     internal readonly record struct ConnectionState(uint State, string Message, ulong LoginRequestSerial);
@@ -186,6 +217,17 @@ public sealed class NativeBridgeBackend : IBridgeBackend
         if (handle is null || handle.IsClosed) return new(BridgeState.Idle, false, 0, double.NaN, double.NaN);
         ThrowIfFailed(Native.pb_get_status(handle, out var status), handle, "状态读取失败");
         ThrowIfFailed(Native.pb_get_timing_stats(handle, out var timing), handle, "统计读取失败");
+        ThrowIfFailed(Native.pb_get_latency_stats(handle, out var latency), handle, "延迟分布读取失败");
+        ThrowIfFailed(Native.pb_get_controller_status(handle, out var controller), handle, "手柄状态读取失败");
+        InputHealthSnapshot? inputHealth = null;
+        if (status.ControllerIndex < XInputSlots)
+        {
+            ThrowIfFailed(Native.pb_get_input_health(handle, out var health), handle, "输入健康状态读取失败");
+            inputHealth = new(checked((long)health.ReadCount), checked((long)health.PacketChanges), checked((long)health.ReadFailures),
+                health.LastReadAgeMilliseconds, health.LastChangeAgeMilliseconds, health.LastReadDurationMicroseconds,
+                health.PacketNumber, health.ReadError, health.LeftX, health.LeftY, health.RightX, health.RightY,
+                health.Buttons, health.L2, health.R2) { ReadStalls = health.ReadStalls };
+        }
         var state = status.State switch
         {
             1 or 2 or 4 => BridgeState.Connecting,
@@ -195,8 +237,31 @@ public sealed class NativeBridgeBackend : IBridgeBackend
         };
         return new(state, status.ControllerPresent != 0, checked((long)status.InputReports),
             timing.Count == 0 ? double.NaN : timing.MeanMicroseconds,
-            timing.Count == 0 ? double.NaN : timing.MaxMicroseconds, Decode(status.Message));
+            timing.Count == 0 ? double.NaN : timing.MaxMicroseconds, Decode(status.Message))
+        {
+            ControllerMessage = state is BridgeState.Connecting or BridgeState.Connected
+                ? DescribeController(controller.State, controller.SystemError, status.ControllerIndex >= XInputSlots) : null,
+            ControllerState = controller.State,
+            ControllerSystemError = controller.SystemError,
+            InputHealth = inputHealth,
+            Latency = new(checked((long)latency.SubmitCount), checked((long)latency.IntervalCount),
+                latency.SubmitP95, latency.SubmitP99, latency.IntervalMean, latency.IntervalP95,
+                latency.IntervalP99, latency.IntervalMax, checked((long)latency.SubmitFailures))
+        };
     }
+
+    internal static string? DescribeController(uint state, uint systemError, bool hid) => state switch
+    {
+        0 => "正在等待所选手柄的输入。",
+        1 => null,
+        2 when hid => "所选 HID 手柄已离线，请重新插入同一设备，或在手柄列表中选择其他设备。",
+        2 => "所选 XInput 手柄未连接，请连接手柄并切换到 Xbox / PC 模式，或重新选择手柄。",
+        3 => "无法访问所选 HID 手柄，请关闭独占手柄的其他程序（如 Steam、DS4Windows 或 Chiaki），然后重试。",
+        4 when !hid && systemError == 1460 => "XInput 手柄读取超时，已请求释放输入，正在等待驱动恢复。（系统错误 1460）",
+        4 => $"读取所选 {(hid ? "HID" : "XInput")} 手柄失败，请检查 USB / 蓝牙连接并重新插入手柄。（系统错误 {systemError}）",
+        5 => "手柄持续上报两个摇杆同向顶到底部，已暂停转发以免画面一直旋转；松开摇杆或重新插拔手柄后会自动恢复。",
+        _ => "手柄状态未知，请刷新列表并重新选择。"
+    };
 
     private uint backMapping;
     /// <summary>0 = touchpad click (default), 1 = share. Applied live to an active session.</summary>
@@ -249,9 +314,10 @@ public sealed class NativeBridgeBackend : IBridgeBackend
         {
             if (Marshal.SizeOf<NativeCredentials>() != 84 || Marshal.SizeOf<NativeStatus>() != 288 ||
                 Marshal.SizeOf<NativeTiming>() != 24 || Marshal.SizeOf<NativeInputDebug>() != 56 ||
-                Marshal.SizeOf<NativeHidInfo>() != 72)
+                Marshal.SizeOf<NativeHidInfo>() != 1608 || Marshal.SizeOf<NativeLatency>() != 72 || Marshal.SizeOf<NativeControllerStatus>() != 8 ||
+                Marshal.SizeOf<NativeInputHealth>() != 80)
                 throw new InvalidOperationException("原生接口结构布局不匹配。");
-            if (Native.pb_abi_version() != 3) throw new InvalidOperationException("原生桥接库版本不匹配，请重新解压完整发行包。");
+            if (Native.pb_abi_version() != 6) throw new InvalidOperationException("原生桥接库版本不匹配，请重新解压完整发行包。");
             libraryChecked = true;
         }
         catch (Exception exception) when (exception is DllNotFoundException or BadImageFormatException or EntryPointNotFoundException)
@@ -345,17 +411,36 @@ public sealed class NativeBridgeBackend : IBridgeBackend
     [StructLayout(LayoutKind.Sequential)]
     private struct NativeTiming { public ulong Count; public double MeanMicroseconds, MaxMicroseconds; }
     [StructLayout(LayoutKind.Sequential)]
+    private struct NativeLatency
+    {
+        public ulong SubmitCount, IntervalCount;
+        public double SubmitP95, SubmitP99, IntervalMean, IntervalP95, IntervalP99, IntervalMax;
+        public ulong SubmitFailures;
+    }
+    [StructLayout(LayoutKind.Sequential)]
     private struct NativeHidInfo
     {
         public ushort VendorId, ProductId;
         public uint Layout;
         [MarshalAs(UnmanagedType.ByValArray, SizeConst = 64)] public byte[] Name;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 1536)] public byte[] DeviceId;
     }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeControllerStatus { public uint State, SystemError; }
     [StructLayout(LayoutKind.Sequential)]
     private struct NativeInputDebug
     {
         public uint Buttons, L2, R2, ControllerPresent;
         public ulong ObservedChanges, SubmitFailures, L1DownCount, R1DownCount, L1R1DownCount;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeInputHealth
+    {
+        public ulong ReadCount, PacketChanges, ReadFailures;
+        public double LastReadAgeMilliseconds, LastChangeAgeMilliseconds, LastReadDurationMicroseconds;
+        public uint PacketNumber, ReadError;
+        public short LeftX, LeftY, RightX, RightY;
+        public uint Buttons, L2, R2, ReadStalls;
     }
 
     private static class Native
@@ -371,17 +456,24 @@ public sealed class NativeBridgeBackend : IBridgeBackend
         internal static extern int pb_register(BridgeHandle context,
             [MarshalAs(UnmanagedType.LPUTF8Str)] string host, byte[] accountId, uint pin, uint timeout, out NativeCredentials result);
         [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int pb_start(BridgeHandle context,
-            [MarshalAs(UnmanagedType.LPUTF8Str)] string host, ref NativeCredentials credentials, uint controller);
+        internal static extern int pb_start_device(BridgeHandle context,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string host, ref NativeCredentials credentials, uint controller,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string? deviceId);
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int pb_set_controller_device(BridgeHandle context, uint controller,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string? deviceId);
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)] internal static extern int pb_get_controller_status(BridgeHandle context, out NativeControllerStatus status);
         [DllImport(Library, CallingConvention = CallingConvention.Cdecl)] internal static extern int pb_stop(BridgeHandle context);
         [DllImport(Library, CallingConvention = CallingConvention.Cdecl)] internal static extern int pb_get_status(BridgeHandle context, out NativeStatus status);
         [DllImport(Library, CallingConvention = CallingConvention.Cdecl)] internal static extern int pb_get_timing_stats(BridgeHandle context, out NativeTiming timing);
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)] internal static extern int pb_get_latency_stats(BridgeHandle context, out NativeLatency latency);
         [DllImport(Library, CallingConvention = CallingConvention.Cdecl)] internal static extern int pb_set_poll_interval(BridgeHandle context, uint microseconds);
         [DllImport(Library, CallingConvention = CallingConvention.Cdecl)] internal static extern int pb_button(BridgeHandle context, uint flags, uint pressed);
         [DllImport(Library, CallingConvention = CallingConvention.Cdecl)] internal static extern int pb_set_back_mapping(BridgeHandle context, uint mapping);
         [DllImport(Library, CallingConvention = CallingConvention.Cdecl)] internal static extern int pb_set_login_pin(BridgeHandle context, [MarshalAs(UnmanagedType.LPUTF8Str)] string digits);
         [DllImport(Library, CallingConvention = CallingConvention.Cdecl)] internal static extern ulong pb_login_request_serial(BridgeHandle context);
         [DllImport(Library, CallingConvention = CallingConvention.Cdecl)] internal static extern int pb_get_input_debug(BridgeHandle context, out NativeInputDebug status);
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)] internal static extern int pb_get_input_health(BridgeHandle context, out NativeInputHealth health);
     }
 }
 

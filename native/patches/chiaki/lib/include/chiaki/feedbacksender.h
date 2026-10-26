@@ -42,7 +42,12 @@ typedef struct chiaki_feedback_sender_t
 	ChiakiSeqNum16 history_packet_seq_num;
 	uint64_t resend_due_us;
 	unsigned resend_stage;
-	uint64_t last_feedback_state_us;
+	uint64_t state_resend_due_us;
+	unsigned state_resend_stage;
+	uint64_t state_retry_due_us, history_retry_due_us;
+	ChiakiErrorCode state_error, history_error;
+	uint64_t last_feedback_state_us; // last attempt, including errors; bounds keepalive wakeups
+	uint64_t last_feedback_history_us; // independent of stick traffic; repairs burst packet loss
 
 	bool should_stop;
 	ChiakiControllerState controller_state_prev; // last sent in a feedback state packet

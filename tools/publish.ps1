@@ -11,6 +11,8 @@ if (-not (Test-Path -LiteralPath (Join-Path $bridgeRoot 'native/out/ps5bridge.dl
 $bridgeOutput = Join-Path $bridgeRoot 'dist/PS5InputBridge'
 & dotnet test (Join-Path $bridgeRoot 'tests/Ps5Bridge.Tests/Ps5Bridge.Tests.csproj') -c Release --verbosity minimal
 if ($LASTEXITCODE -ne 0) { throw 'Managed/native integration tests failed.' }
+& dotnet run --project (Join-Path $bridgeRoot 'tests/Ps5Bridge.UiChecks/UiChecks.csproj') -c Release -p:TreatWarningsAsErrors=true
+if ($LASTEXITCODE -ne 0) { throw 'Offline WPF checks failed.' }
 & dotnet publish (Join-Path $bridgeRoot 'src/Ps5Bridge.App/Ps5Bridge.App.csproj') -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:TreatWarningsAsErrors=true -o $bridgeOutput
 if ($LASTEXITCODE -ne 0) { throw 'Desktop publish failed.' }
 $bridgeRuntimeConfig = Get-Content -LiteralPath (Join-Path $bridgeOutput 'Ps5InputBridge.runtimeconfig.json') -Raw | ConvertFrom-Json
@@ -37,4 +39,8 @@ Copy-Item -LiteralPath (Join-Path $bridgeRoot 'THIRD-PARTY-NOTICES.md') -Destina
 Copy-Item -LiteralPath (Join-Path $bridgeRoot 'licenses') -Destination $bridgeOutput -Recurse -Force
 & python (Join-Path $PSScriptRoot 'package-source.py')
 if ($LASTEXITCODE -ne 0) { throw 'Corresponding source package failed.' }
+$bridgeArchive = Join-Path $bridgeRoot 'dist/PS5InputBridge-win-x64.zip'
+$bridgeSourceArchive = Join-Path $bridgeRoot 'dist/PS5InputBridge-source.zip'
+Compress-Archive -LiteralPath @($bridgeOutput, $bridgeSourceArchive) -DestinationPath $bridgeArchive -Force
+Write-Output "Shareable package: $bridgeArchive"
 Write-Output "Ready: $bridgeOutput/Ps5InputBridge.exe"

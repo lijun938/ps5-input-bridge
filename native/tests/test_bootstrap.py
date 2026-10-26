@@ -10,6 +10,20 @@ bootstrap = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bootstrap)
 
 class Downloads(unittest.TestCase):
+    def test_checked_patch_is_repeatable_and_rejects_unexpected_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root/'source.c'
+            target.write_text('before\n', encoding='utf-8')
+            edits = [{'file':'source.c', 'before':'before\n', 'after':'after\n'}]
+            bootstrap.apply_checked_edits(root, edits)
+            bootstrap.apply_checked_edits(root, edits)
+            self.assertEqual(target.read_text(), 'after\n')
+            target.write_text('changed baseline\n', encoding='utf-8')
+            with self.assertRaises(RuntimeError):
+                bootstrap.apply_checked_edits(root, edits)
+            self.assertEqual(target.read_text(), 'changed baseline\n')
+
     def test_truncated_download_never_becomes_a_cached_archive_and_retry_succeeds(self):
         class Handler(BaseHTTPRequestHandler):
             count = 0

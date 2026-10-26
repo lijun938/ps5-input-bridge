@@ -1,0 +1,12 @@
+[
+  {
+    "file": "lib/src/session.c",
+    "before": "\tif(session->stream_connection.feedback_sender_active)\n\t\tchiaki_feedback_sender_set_controller_state(&session->stream_connection.feedback_sender, &session->controller_state);\n\tchiaki_mutex_unlock(&session->stream_connection.feedback_sender_mutex);\n\treturn CHIAKI_ERR_SUCCESS;",
+    "after": "\tif(session->stream_connection.feedback_sender_active)\n\t\terr = chiaki_feedback_sender_set_controller_state(&session->stream_connection.feedback_sender, &session->controller_state);\n\tchiaki_mutex_unlock(&session->stream_connection.feedback_sender_mutex);\n\treturn err;"
+  },
+  {
+    "file": "lib/src/takion.c",
+    "before": "\tchiaki_takion_send_raw(takion, buf, buf_size);\n\nbeach:\n\tchiaki_mutex_unlock(&takion->gkcrypt_local_mutex);\n\treturn err;",
+    "after": "\terr = chiaki_takion_send_raw(takion, buf, buf_size);\n\nbeach:\n\tchiaki_mutex_unlock(&takion->gkcrypt_local_mutex);\n\treturn err;"
+  }
+]

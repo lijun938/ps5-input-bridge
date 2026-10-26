@@ -15,10 +15,12 @@ if ($LASTEXITCODE -ne 0) { throw 'Native CMake configure failed.' }
 & $bridgeCmake --build $bridgeBuild --parallel 8
 if ($LASTEXITCODE -ne 0) { throw 'Native build failed.' }
 if (-not $SkipTests) {
-    & (Join-Path $bridgeBuild 'ps5bridge-tests.exe')
-    if ($LASTEXITCODE -ne 0) { throw 'Native self-tests failed.' }
-    & python (Join-Path $bridgeRoot 'native/tests/test_abi.py')
-    if ($LASTEXITCODE -ne 0) { throw 'Native ABI/lifetime tests failed.' }
+    foreach ($bridgeTest in @('ps5bridge-tests.exe', 'ps5bridge-feedback-tests.exe', 'ps5bridge-transport-tests.exe', 'ps5bridge-input-tests.exe')) {
+        & (Join-Path $bridgeBuild $bridgeTest)
+        if ($LASTEXITCODE -ne 0) { throw "Native test failed: $bridgeTest" }
+    }
+    & python -m unittest discover -s (Join-Path $bridgeRoot 'native/tests') -p 'test_*.py' -v
+    if ($LASTEXITCODE -ne 0) { throw 'Native ABI/lifetime/bootstrap tests failed.' }
 }
 $bridgeOut = Join-Path $bridgeRoot 'native/out'
 New-Item -ItemType Directory -Force -Path $bridgeOut | Out-Null
