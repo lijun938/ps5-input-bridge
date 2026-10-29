@@ -5,6 +5,12 @@
 #include "../src/ps5bridge.c"
 #undef chiaki_session_set_controller_state
 
+static void publish_test_statistics(pb_context *ctx) {
+    EnterCriticalSection(&ctx->lock);
+    stats_publish_locked(ctx, 0, 0, 1);
+    LeaveCriticalSection(&ctx->lock);
+}
+
 typedef struct input_sample {
     DWORD index;
     WORD buttons;
@@ -95,6 +101,7 @@ static int run_samples(const input_sample *samples, unsigned count, unsigned fai
     if(successful_report_count) *successful_report_count = context.status.input_reports;
     CloseHandle(context.input_stop);
     DeleteCriticalSection(&context.operation);
+    if(context.stats_initialized) DeleteCriticalSection(&context.stats_lock);
     DeleteCriticalSection(&context.lock);
     test_context = NULL;
     return !unexpected_index;
@@ -275,6 +282,7 @@ static int run_xinput_error_case(DWORD error, int recover) {
         && submissions[2].state.l2_state == 255 && submissions[2].state.left_x == -24000
         && submissions[2].state.right_y == -20000;
     CloseHandle(context.input_stop);
+    if(context.stats_initialized) DeleteCriticalSection(&context.stats_lock);
     DeleteCriticalSection(&context.lock);
     test_context = NULL;
     return ok;
@@ -469,6 +477,7 @@ static int test_failed_slot_switch_releases_once(void) {
     int ok = submission_count == 6 && neutral(&submissions[1].state) && !tracker.submission_pending;
     for(unsigned i = 2; i < submission_count; i++)
         ok &= submissions[i].state.buttons == CHIAKI_CONTROLLER_BUTTON_BOX;
+    if(context.stats_initialized) DeleteCriticalSection(&context.stats_lock);
     DeleteCriticalSection(&context.lock);
     return ok;
 }
@@ -535,6 +544,7 @@ static double measured_period_us(uint32_t poll_us, int moves) {
     context.input_stop = CreateEventW(NULL,TRUE,FALSE,NULL);
     context.poll_us = poll_us;
     context.status.state = PB_CONNECTED;
+    context.xinput_timing_enabled = 1;
     test_context = &context;
     rate_samples = 0; submission_count = 0;
     get_state_fn original_get_state = get_state;
@@ -563,6 +573,7 @@ static double measured_period_us(uint32_t poll_us, int moves) {
     get_state = original_get_state;
     CloseHandle(context.input_stop);
     DeleteCriticalSection(&context.operation);
+    if(context.stats_initialized) DeleteCriticalSection(&context.stats_lock);
     DeleteCriticalSection(&context.lock);
     test_context = NULL;
     return (double)(end.QuadPart-start.QuadPart)*1000000.0/(double)frequency.QuadPart/rate_samples;
@@ -582,12 +593,14 @@ static int test_sampling_periods(void) {
 static int test_latency_window(void) {
     pb_context context = {0};
     InitializeCriticalSection(&context.lock);
+    context.xinput_timing_enabled = 1;
     latency_push(&context.submit_latency, 100000); /* Must age out of the bounded window. */
     for(unsigned i = 1; i <= 1024; i++) {
         latency_push(&context.submit_latency, i);
         latency_push(&context.sample_intervals, i);
     }
     context.input_debug.submit_failures = 7;
+    publish_test_statistics(&context);
     pb_latency_stats stats;
     int ok = pb_get_latency_stats(&context, &stats) == PB_OK
         && stats.submit_count == 1024 && stats.interval_count == 1024
@@ -595,6 +608,7 @@ static int test_latency_window(void) {
         && stats.interval_p95_us == 973 && stats.interval_p99_us == 1014
         && stats.interval_mean_us == 512.5 && stats.interval_max_us == 1024
         && stats.submit_failures == 7;
+    if(context.stats_initialized) DeleteCriticalSection(&context.stats_lock);
     DeleteCriticalSection(&context.lock);
     return ok;
 }
@@ -602,6 +616,7 @@ static int test_latency_window(void) {
 static int test_sample_interval_boundaries(void) {
     pb_context context = {0};
     InitializeCriticalSection(&context.lock);
+    context.xinput_timing_enabled = 1;
     input_tracker tracker;
     tracker_init(&tracker);
     tracker.frequency.QuadPart = 1000000;
@@ -618,8 +633,10 @@ static int test_sample_interval_boundaries(void) {
     process_sample(&context, &tracker, 0, 1, &state, 10500);
     process_sample(&context, &tracker, 1, 1, &state, 11000);
     process_sample(&context, &tracker, 1, 1, &state, 11500);
+    publish_test_statistics(&context);
     pb_latency_stats stats;
     pb_get_latency_stats(&context, &stats);
+    if(context.stats_initialized) DeleteCriticalSection(&context.stats_lock);
     DeleteCriticalSection(&context.lock);
     return handshake_ignored && stats.interval_count == 3
         && stats.interval_mean_us == 500 && stats.interval_p99_us == 500;

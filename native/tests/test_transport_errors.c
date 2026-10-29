@@ -19,7 +19,7 @@ int main(void) {
     ChiakiFeedbackState feedback = {0};
     uint8_t history[] = {0x80, 0x8a, 255};
     int state_error = chiaki_takion_send_feedback_state(&takion, 0, &feedback) == CHIAKI_ERR_NETWORK;
-    int history_error = chiaki_takion_send_feedback_history(&takion, 0, history, sizeof(history)) == CHIAKI_ERR_NETWORK;
+    int history_error = chiaki_takion_send_feedback_history(&takion, 0, 1, history, sizeof(history)) == CHIAKI_ERR_NETWORK;
 
     ChiakiSession session = {0};
     chiaki_controller_state_set_idle(&session.controller_state);
@@ -43,7 +43,7 @@ int main(void) {
         || connect(transmitter, (struct sockaddr *)&address, sizeof(address))) return 1;
     DWORD timeout = 300;
     setsockopt(receiver, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
-    /* The worker may be retrying, so replace the socket under its send lock. */
+    /* The sender may be sending a tail resend or keepalive; replace the socket under its send lock. */
     chiaki_mutex_lock(&sender->state_mutex);
     takion.sock = transmitter;
     chiaki_mutex_unlock(&sender->state_mutex);

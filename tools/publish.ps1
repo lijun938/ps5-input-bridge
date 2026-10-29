@@ -37,6 +37,10 @@ Copy-Item -LiteralPath (Join-Path $bridgeRoot 'README.md') -Destination $bridgeO
 Copy-Item -LiteralPath (Join-Path $bridgeRoot 'LICENSE') -Destination $bridgeOutput -Force
 Copy-Item -LiteralPath (Join-Path $bridgeRoot 'THIRD-PARTY-NOTICES.md') -Destination $bridgeOutput -Force
 Copy-Item -LiteralPath (Join-Path $bridgeRoot 'licenses') -Destination $bridgeOutput -Recurse -Force
+foreach ($bridgeLauncher in @('launch-normal.cmd', 'launch-timing.cmd', 'launch-diagnostics.cmd')) {
+    Copy-Item -LiteralPath (Join-Path $bridgeRoot "tools/latency-contention/$bridgeLauncher") -Destination $bridgeOutput -Force
+}
+Copy-Item -LiteralPath (Join-Path $bridgeRoot 'docs/validation/2026-10-29-latency-test-guide.md') -Destination (Join-Path $bridgeOutput 'INPUT-LATENCY-GUIDE.md') -Force
 & python (Join-Path $PSScriptRoot 'package-source.py')
 if ($LASTEXITCODE -ne 0) { throw 'Corresponding source package failed.' }
 $bridgeArchive = Join-Path $bridgeRoot 'dist/PS5InputBridge-win-x64.zip'

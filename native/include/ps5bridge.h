@@ -116,7 +116,9 @@ PB_API int32_t PB_CALL pb_get_controller_status(pb_context *ctx, pb_controller_s
  * HID controllers are event driven (each USB report is processed on arrival) and ignore this. */
 PB_API int32_t PB_CALL pb_set_poll_interval(pb_context *ctx, uint32_t microseconds);
 PB_API int32_t PB_CALL pb_get_timing_stats(pb_context *ctx, pb_timing_stats *result);
-/* Copies bounded samples under lock; computes percentiles after releasing the input lock. */
+/* Reads a separate snapshot (normally up to 100 ms old); never takes the input
+ * lock. Detailed timing is opt-in: PS5BRIDGE_XINPUT_TIMING=1 or PS5BRIDGE_TRACE=1.
+ * Input skips publishing when the UI snapshot lock is busy. */
 PB_API int32_t PB_CALL pb_get_latency_stats(pb_context *ctx, pb_latency_stats *result);
 PB_API int32_t PB_CALL pb_button(pb_context *ctx, uint32_t flags, uint32_t pressed);
 /* Takes effect on the next input sample; no reconnect needed. Default PB_BACK_TOUCHPAD. */

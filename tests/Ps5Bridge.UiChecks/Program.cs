@@ -85,10 +85,20 @@ internal static class Program
         poll.SelectedIndex = 1;
         Assert(((ComboBoxItem)poll.SelectedItem).Tag.ToString() == "100", "100 us must remain selectable");
         var apply = typeof(MainWindow).GetMethod("ApplyMetrics", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var metrics = (TextBlock)main.FindName("MetricsText");
         var latency = (TextBlock)main.FindName("LatencyText");
         var sampling = (TextBlock)main.FindName("SamplingText");
         apply.Invoke(main, [new BackendSnapshot(BridgeState.Connecting, false, 0, double.NaN, double.NaN)]);
         Assert(latency.Text.Contains('—') && sampling.Text.Contains('—'), "No samples must display dashes instead of zero latency");
+        apply.Invoke(main, [new BackendSnapshot(BridgeState.Connected, true, 12345, double.NaN, double.NaN)
+        {
+            Latency = new(0, 0, 0, 0, 0, 0, 0, 0, 7)
+        }]);
+        Assert(metrics.Text.Contains('—') && metrics.Text.Contains($"{12345:N0} 次")
+            && !metrics.Text.Contains("NaN") && !metrics.Text.Contains("μs"),
+            "Reports without timing must retain the count and show a dash, never NaN or zero latency");
+        Assert(latency.Text.Contains('—') && latency.Text.Contains("7 次") && sampling.Text.Contains('—'),
+            "HID without timing must retain failure counts and show empty latency windows");
         apply.Invoke(main, [new BackendSnapshot(BridgeState.Connected, true, 123456789, 123.4, 123456.7)
         {
             Latency = new(1024, 1024, 234.5, 345.6, 501, 701, 1001, 123456, 12345)

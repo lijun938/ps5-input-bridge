@@ -1,10 +1,10 @@
 # Third-party components
 
-PS5 Input Bridge uses the following upstream components. Native libraries are statically linked; source pins and download URLs are recorded in `native/scripts/bootstrap.py`. The chiaki-ng feedback sender and its header are modified for synchronous input, complete control history, short state/history repeats and transport-error recovery; complete replacements are in `native/patches/chiaki/`. Checked edits to `lib/src/session.c` and `lib/src/takion.c` propagate send errors and are recorded in `native/patches/chiaki-return-errors.json`. The bootstrap applies both patch forms to the pinned source. Distribute corresponding PS5 Input Bridge source and build instructions with binaries under AGPL-3.0; keep all upstream notices.
+PS5 Input Bridge uses the following upstream components. Native libraries are statically linked; source pins and download URLs are recorded in `native/scripts/bootstrap.py`. chiaki-ng's `lib/src/feedbacksender.c` is modified to send on the caller's thread, and `lib/src/session.c` and `lib/src/takion.c` to propagate send errors. Protocol and optional feedback diagnostic edits are recorded in `native/patches/chiaki-edits.json`; the retained GKCrypt optimizations are checked edits in `native/patches/chiaki-low-latency.json`, which the bootstrap applies to the pinned source. Distribute corresponding PS5 Input Bridge source and build instructions with binaries under AGPL-3.0; keep all upstream notices.
 
 | Component | Version / source | License copy |
 | --- | --- | --- |
-| chiaki-ng / libchiaki | v1.10.0, `0c4a45df0cae2af2ba2daef84e881850b07038a3` | `licenses/chiaki-ng-COPYING` (AGPL-3.0 and OpenSSL exception) |
+| chiaki-ng / libchiaki | main, `c8bea2642d0e95402f373af55584a3b98cd89417` (2026-10-09) | `licenses/chiaki-ng-COPYING` (AGPL-3.0 and OpenSSL exception) |
 | mbedTLS | 2.28.0 pinned commit | `licenses/mbedtls-LICENSE` |
 | json-c | 0.17 | `licenses/json-c-COPYING` |
 | miniupnpc | 2.2.8 | `licenses/miniupnpc-LICENSE` |

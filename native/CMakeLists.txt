@@ -99,6 +99,39 @@ add_executable(ps5bridge-input-tests tests/test_input_worker.c)
 target_include_directories(ps5bridge-input-tests PRIVATE include)
 target_link_libraries(ps5bridge-input-tests PRIVATE chiaki-lib winmm setupapi hid)
 target_compile_options(ps5bridge-input-tests PRIVATE -Wall -Wextra -Werror)
+add_executable(ps5bridge-hid-tests tests/test_hid_worker.c)
+target_include_directories(ps5bridge-hid-tests PRIVATE include)
+target_link_libraries(ps5bridge-hid-tests PRIVATE chiaki-lib winmm setupapi hid)
+target_compile_options(ps5bridge-hid-tests PRIVATE -Wall -Wextra -Werror)
+add_executable(ps5bridge-snapshot-tests tests/test_latency_snapshot.c)
+target_include_directories(ps5bridge-snapshot-tests PRIVATE include)
+target_link_libraries(ps5bridge-snapshot-tests PRIVATE chiaki-lib winmm setupapi hid)
+target_compile_options(ps5bridge-snapshot-tests PRIVATE -Wall -Wextra -Werror)
+add_executable(ps5bridge-input-diagnostics-tests tests/test_input_diagnostics.c)
+target_compile_options(ps5bridge-input-diagnostics-tests PRIVATE -Wall -Wextra -Werror)
 add_executable(ps5bridge-transport-tests tests/test_transport_errors.c)
 target_link_libraries(ps5bridge-transport-tests PRIVATE chiaki-lib)
 target_compile_options(ps5bridge-transport-tests PRIVATE -Wall -Wextra -Werror)
+add_executable(ps5bridge-feedback-wakeup-tests tests/test_feedback_wakeup.c
+    "${CHIAKI}/lib/src/feedback.c" "${CHIAKI}/lib/src/controller.c"
+    "${CHIAKI}/lib/src/thread.c" "${CHIAKI}/lib/src/time.c"
+    "${CHIAKI}/lib/src/log.c")
+target_include_directories(ps5bridge-feedback-wakeup-tests PRIVATE
+    "${CHIAKI}/lib/include" "${CMAKE_CURRENT_BINARY_DIR}/chiaki-lib/include")
+target_link_libraries(ps5bridge-feedback-wakeup-tests PRIVATE ws2_32 winmm)
+set_source_files_properties(tests/test_feedback_wakeup.c
+    PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
+add_executable(ps5bridge-feedback-diagnostics-tests tests/test_feedback_diagnostics.c
+    "${CHIAKI}/lib/src/feedback.c" "${CHIAKI}/lib/src/controller.c"
+    "${CHIAKI}/lib/src/thread.c" "${CHIAKI}/lib/src/time.c" "${CHIAKI}/lib/src/log.c")
+target_include_directories(ps5bridge-feedback-diagnostics-tests PRIVATE
+    "${CHIAKI}/lib/include" "${CMAKE_CURRENT_BINARY_DIR}/chiaki-lib/include")
+target_link_libraries(ps5bridge-feedback-diagnostics-tests PRIVATE ws2_32 winmm)
+set_source_files_properties(tests/test_feedback_diagnostics.c
+    PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror")
+add_executable(ps5bridge-crypto-tests tests/test_crypto_fastpath.c)
+target_link_libraries(ps5bridge-crypto-tests PRIVATE chiaki-lib)
+target_compile_options(ps5bridge-crypto-tests PRIVATE -Wall -Wextra -Werror)
+add_executable(ps5bridge-history-tests tests/test_history_fastpath.c)
+target_link_libraries(ps5bridge-history-tests PRIVATE chiaki-lib)
+target_compile_options(ps5bridge-history-tests PRIVATE -Wall -Wextra -Werror)

@@ -422,6 +422,8 @@ public partial class MainWindow : Window
         ControllerStatusText.Text = snapshot.ControllerMessage ?? (snapshot.ControllerConnected ? "手柄：已连接" : "手柄：未连接");
         MetricsText.Text = snapshot.InputReports == 0
             ? "PC 采集 → 提交：—"
+            : !double.IsFinite(snapshot.MeanSubmitMicroseconds) || !double.IsFinite(snapshot.MaxSubmitMicroseconds)
+            ? $"PC 采集 → 提交：—　·　{snapshot.InputReports:N0} 次"
             : $"PC 采集 → 提交：平均 {snapshot.MeanSubmitMicroseconds:F1} μs / 最大 {snapshot.MaxSubmitMicroseconds:F1} μs　·　{snapshot.InputReports:N0} 次";
         var latency = snapshot.Latency;
         LatencyText.Text = latency is { SubmitSamples: > 0 }

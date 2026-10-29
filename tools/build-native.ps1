@@ -15,7 +15,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Native CMake configure failed.' }
 & $bridgeCmake --build $bridgeBuild --parallel 8
 if ($LASTEXITCODE -ne 0) { throw 'Native build failed.' }
 if (-not $SkipTests) {
-    foreach ($bridgeTest in @('ps5bridge-tests.exe', 'ps5bridge-feedback-tests.exe', 'ps5bridge-transport-tests.exe', 'ps5bridge-input-tests.exe')) {
+    foreach ($bridgeTest in @('ps5bridge-tests.exe', 'ps5bridge-feedback-tests.exe', 'ps5bridge-feedback-wakeup-tests.exe', 'ps5bridge-feedback-diagnostics-tests.exe', 'ps5bridge-input-diagnostics-tests.exe', 'ps5bridge-crypto-tests.exe', 'ps5bridge-history-tests.exe', 'ps5bridge-transport-tests.exe', 'ps5bridge-input-tests.exe', 'ps5bridge-hid-tests.exe', 'ps5bridge-snapshot-tests.exe')) {
         & (Join-Path $bridgeBuild $bridgeTest)
         if ($LASTEXITCODE -ne 0) { throw "Native test failed: $bridgeTest" }
     }

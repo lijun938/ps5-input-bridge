@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <limits.h>
+#include "input_diagnostics.h"
 
 _Static_assert(sizeof(pb_credentials) == 84, "credentials ABI");
 _Static_assert(sizeof(pb_status) == 288, "status ABI");
@@ -71,11 +72,21 @@ static double latency_percentile(const double *sorted, uint32_t count, unsigned 
 
 struct pb_context {
     CRITICAL_SECTION lock, operation;
+    CRITICAL_SECTION stats_lock;
+    INIT_ONCE stats_once;
+    int stats_initialized;
+    volatile LONG64 stats_revision;
+    LONG64 published_revision;
+    pb_timing_stats published_timing;
+    latency_series published_submits, published_intervals;
+    volatile LONG64 stats_failures;
+    LONGLONG stats_next_ticks;
+    int stats_dirty;
     pb_status status;
     pb_timing_stats timing;
     pb_input_debug input_debug;
     pb_input_health input_health;
-    LONGLONG input_read_started, input_read_completed, input_packet_changed;
+    LONGLONG input_read_started, input_read_completed, input_packet_changed, input_read_duration_ticks;
     uint64_t input_read_generation;
     int input_read_pending, input_read_timed_out;
     pb_controller_status controller_status;
@@ -95,7 +106,75 @@ struct pb_context {
     char host[256];
     trace_entry *trace;
     size_t trace_len;
+    int hid_timing_enabled; /* session setting, survives flushing/freeing the trace */
+    int xinput_timing_enabled;
+    input_diagnostics *diagnostics;
 };
+
+/* Only the input worker records these stages. Stop joins it before export. */
+static void input_lock(pb_context *ctx, enum input_diagnostic_stage stage) {
+    uint64_t start = ctx->diagnostics ? input_diagnostic_clock() : 0;
+    EnterCriticalSection(&ctx->lock);
+    if(ctx->diagnostics)
+        input_diagnostic_record(ctx->diagnostics, stage, start, input_diagnostic_clock());
+}
+
+static int environment_enabled(const wchar_t *name) {
+    wchar_t value[4];
+    return GetEnvironmentVariableW(name, value, 4) == 1 && value[0] == L'1';
+}
+
+/* The UI never holds the input lock while copying percentile windows. The input
+ * worker only tries this separate lock: a stalled UI delays telemetry, not input.
+ * Lazy initialization also supports the existing stack-owned test contexts. */
+static BOOL CALLBACK stats_initialize(PINIT_ONCE once, PVOID arg, PVOID *unused) {
+    (void)once; (void)unused;
+    pb_context *ctx = arg;
+    InitializeCriticalSection(&ctx->stats_lock);
+    ctx->stats_initialized = 1;
+    return TRUE;
+}
+static void stats_ensure_initialized(pb_context *ctx) {
+    InitOnceExecuteOnce(&ctx->stats_once, stats_initialize, ctx, NULL);
+}
+static int detailed_timing_enabled(const pb_context *ctx) {
+    return ctx->status.controller_index >= PB_XINPUT_SLOTS
+        ? ctx->hid_timing_enabled : ctx->xinput_timing_enabled;
+}
+/* Caller holds input lock. Force is only used after the input worker has stopped. */
+static void stats_publish_locked(pb_context *ctx, LONGLONG captured, LONGLONG frequency, int force) {
+    if(!force && (!ctx->stats_dirty || (captured && captured < ctx->stats_next_ticks))) return;
+    stats_ensure_initialized(ctx);
+    if(force) EnterCriticalSection(&ctx->stats_lock);
+    else if(!TryEnterCriticalSection(&ctx->stats_lock)) {
+        if(captured) ctx->stats_next_ticks = captured + frequency / 1000;
+        return;
+    }
+    if(detailed_timing_enabled(ctx)) {
+        ctx->published_timing = ctx->timing;
+        ctx->published_submits = ctx->submit_latency;
+        ctx->published_intervals = ctx->sample_intervals;
+    } else {
+        memset(&ctx->published_timing, 0, sizeof(ctx->published_timing));
+        ctx->published_submits.count = ctx->published_intervals.count = 0;
+    }
+    InterlockedExchange64(&ctx->stats_failures, (LONG64)ctx->input_debug.submit_failures);
+    ctx->published_revision = InterlockedCompareExchange64(&ctx->stats_revision, 0, 0);
+    ctx->stats_dirty = 0;
+    ctx->stats_next_ticks = captured ? captured + frequency / 10 : 0;
+    LeaveCriticalSection(&ctx->stats_lock);
+}
+static void stats_reset_locked(pb_context *ctx) {
+    memset(&ctx->timing, 0, sizeof(ctx->timing));
+    ctx->timing_sum = 0;
+    memset(&ctx->submit_latency, 0, sizeof(ctx->submit_latency));
+    memset(&ctx->sample_intervals, 0, sizeof(ctx->sample_intervals));
+    ctx->stats_next_ticks = 0;
+    ctx->stats_dirty = 1;
+    InterlockedExchange64(&ctx->stats_failures, (LONG64)ctx->input_debug.submit_failures);
+    /* Invalidate immediately even if a reader currently owns the snapshot lock. */
+    InterlockedIncrement64(&ctx->stats_revision);
+}
 
 static BOOL CALLBACK initialize(PINIT_ONCE once, PVOID arg, PVOID *unused) {
     (void)once; (void)arg; (void)unused;
@@ -325,6 +404,8 @@ static void controller_select_locked(pb_context *ctx, uint32_t index, const char
         ctx->controller_status = (pb_controller_status){PB_CONTROLLER_WAITING, 0};
         memset(&ctx->input_health, 0, sizeof(ctx->input_health));
         ctx->input_read_completed = ctx->input_packet_changed = 0;
+        ctx->input_read_duration_ticks = 0;
+        stats_reset_locked(ctx);
     }
     ctx->status.controller_index = index;
     strcpy(ctx->controller_device_id, device_id);
@@ -487,12 +568,10 @@ static void tracker_init(input_tracker *t) {
     t->previous_index = UINT32_MAX;
     QueryPerformanceFrequency(&t->frequency);
 }
-/* Clears UI-held special buttons when the pad goes away, as the real ones are released too. */
+/* Caller holds ctx->lock. Clear UI-held buttons when the real pad goes away. */
 static uint32_t special_after_presence(pb_context *ctx, const input_tracker *t, int present, uint32_t special) {
     if(t->was_present && !present) {
-        EnterCriticalSection(&ctx->lock);
         ctx->special = 0;
-        LeaveCriticalSection(&ctx->lock);
         return 0;
     }
     return special;
@@ -508,15 +587,16 @@ static int process_selection(pb_context *ctx, input_tracker *t, uint32_t index, 
     if(t->previous_index != UINT32_MAX && (t->submission_pending || !chiaki_controller_state_equals(&t->previous, &idle))) {
         int released = chiaki_session_set_controller_state(&ctx->session, &idle) == CHIAKI_ERR_SUCCESS;
         t->submission_pending = !released;
-        EnterCriticalSection(&ctx->lock);
         if(released) {
             t->previous = idle;
             t->first = 0;
             ctx->input_debug.buttons = ctx->input_debug.l2 = ctx->input_debug.r2 = 0;
-        } else ctx->input_debug.submit_failures++;
-        LeaveCriticalSection(&ctx->lock);
+        } else {
+            ctx->input_debug.submit_failures++;
+            InterlockedExchange64(&ctx->stats_failures, (LONG64)ctx->input_debug.submit_failures);
+        }
     }
-    /* Remember even a failed release. The feedback sender retries it; the first
+    /* Remember even a failed release. The feedback sender's tail resends repeat it; the first
      * new sample replaces that pending neutral, without injecting neutral again. */
     t->previous_index = index;
     t->previous_generation = generation;
@@ -527,14 +607,14 @@ static int process_selection(pb_context *ctx, input_tracker *t, uint32_t index, 
 }
 /* Submits a captured state when it differs from the last submitted one and records
  * diagnostics. A failed submission keeps the old reference state, so it is retried
- * with the next sample. Returns 1 when the state was submitted. */
+ * with the next sample. Returns 1 when the state was submitted. Caller holds
+ * ctx->lock for this entire operation, including the shared watchdog tracker.
+ * Do not recursively acquire it for every diagnostic update on the hot path. */
 static int process_sample(pb_context *ctx, input_tracker *t, uint32_t index, int present,
         const ChiakiControllerState *state, LONGLONG captured) {
     ChiakiControllerState sample = *state;
-    EnterCriticalSection(&ctx->lock);
     int connected = ctx->status.state == PB_CONNECTED;
     uint64_t generation = ctx->controller_generation;
-    LeaveCriticalSection(&ctx->lock);
     int selection_changed = process_selection(ctx, t, index, generation);
     int urgent = t->first || selection_changed || digital_change(&sample, &t->previous);
     int changed = urgent || t->submission_pending || !chiaki_controller_state_equals(&sample, &t->previous);
@@ -542,7 +622,6 @@ static int process_sample(pb_context *ctx, input_tracker *t, uint32_t index, int
     if(changed) t->submission_pending = !submit_ok;
     if(changed) {
         const uint64_t l1 = CHIAKI_CONTROLLER_BUTTON_L1, r1 = CHIAKI_CONTROLLER_BUTTON_R1;
-        EnterCriticalSection(&ctx->lock);
         pb_input_debug *debug = &ctx->input_debug;
         debug->observed_changes++;
         if(submit_ok) {
@@ -550,24 +629,29 @@ static int process_sample(pb_context *ctx, input_tracker *t, uint32_t index, int
             if((sample.buttons & r1) && !(t->previous.buttons & r1)) debug->r1_presses++;
             if((sample.buttons & (l1|r1)) == (l1|r1) && (t->previous.buttons & (l1|r1)) != (l1|r1)) debug->l1_r1_chords++;
             debug->buttons = (uint32_t)sample.buttons; debug->l2 = sample.l2_state; debug->r2 = sample.r2_state;
-        } else debug->submit_failures++;
-        LeaveCriticalSection(&ctx->lock);
+        } else {
+            debug->submit_failures++;
+            InterlockedExchange64(&ctx->stats_failures, (LONG64)debug->submit_failures);
+        }
     }
-    LARGE_INTEGER submitted;
-    QueryPerformanceCounter(&submitted);
-    if(ctx->trace && urgent && ctx->trace_len < TRACE_CAPACITY)
+    /* Acquisition timestamps still drive the XInput watchdog and poll clock.
+     * Detailed display statistics are optional on both input paths. */
+    int timed = captured && detailed_timing_enabled(ctx);
+    LARGE_INTEGER submitted = {0};
+    if((timed && submit_ok && connected) || (captured && ctx->trace && urgent))
+        QueryPerformanceCounter(&submitted);
+    if(captured && ctx->trace && urgent && ctx->trace_len < TRACE_CAPACITY)
         ctx->trace[ctx->trace_len++] = (trace_entry){captured, submitted.QuadPart,
             (uint32_t)sample.buttons, sample.l2_state, sample.r2_state, (uint8_t)submit_ok, 0};
-    if(submit_ok && connected) {
+    if(submit_ok && connected) ctx->status.input_reports++;
+    if(timed && submit_ok && connected) {
         double elapsed = (double)(submitted.QuadPart-captured)*1000000.0/(double)t->frequency.QuadPart;
-        EnterCriticalSection(&ctx->lock);
-        ctx->status.input_reports++;
         ctx->timing.count++;
         ctx->timing_sum += elapsed;
         latency_push(&ctx->submit_latency, elapsed);
         ctx->timing.mean_us = ctx->timing_sum/(double)ctx->timing.count;
         if(elapsed > ctx->timing.max_us) ctx->timing.max_us = elapsed;
-        LeaveCriticalSection(&ctx->lock);
+        ctx->stats_dirty = 1;
     }
     if(submit_ok) {
         t->previous = sample;
@@ -577,15 +661,17 @@ static int process_sample(pb_context *ctx, input_tracker *t, uint32_t index, int
     t->previous_index = index;
     t->previous_generation = generation;
     t->was_present = present;
-    EnterCriticalSection(&ctx->lock);
-    if(connected && present && !selection_changed && t->last_capture && t->last_capture_index == index && captured >= t->last_capture)
+    if(timed && connected && present && !selection_changed && t->last_capture && t->last_capture_index == index && captured >= t->last_capture) {
         latency_push(&ctx->sample_intervals, (double)(captured - t->last_capture)*1000000.0/(double)t->frequency.QuadPart);
-    t->last_capture = connected && present ? captured : 0;
+        ctx->stats_dirty = 1;
+    }
+    t->last_capture = timed && connected && present ? captured : 0;
     t->last_capture_index = index;
     ctx->status.controller_present = present;
     ctx->input_debug.controller_present = present;
     ctx->status.input_samples++;
-    LeaveCriticalSection(&ctx->lock);
+    if(changed && !submit_ok) ctx->stats_dirty = 1;
+    stats_publish_locked(ctx, captured, t->frequency.QuadPart, 0);
     return submit_ok;
 }
 
@@ -596,8 +682,8 @@ static void hid_release_absent(pb_context *ctx, input_tracker *t, uint32_t index
         uint32_t state, DWORD error) {
     EnterCriticalSection(&ctx->lock);
     if(controller_selection_matches(ctx, index, generation)) {
-        LARGE_INTEGER captured;
-        QueryPerformanceCounter(&captured);
+        LARGE_INTEGER captured = {0};
+        if(ctx->hid_timing_enabled) QueryPerformanceCounter(&captured);
         special_after_presence(ctx, t, 0, 0);
         ChiakiControllerState idle;
         chiaki_controller_state_set_idle(&idle);
@@ -633,59 +719,67 @@ static void hid_session(pb_context *ctx, input_tracker *t, uint32_t index, uint6
     OVERLAPPED ov;
     memset(&ov, 0, sizeof(ov));
     ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
-    uint8_t buf[1024]; /* Bluetooth DS4/DualSense input reports are 547 / 78 bytes */
+    uint8_t buf[1024]; /* Bluetooth DS4/DualSense reports are 547 / 78 bytes */
     DWORD len = devices[n].input_len < sizeof(buf) ? devices[n].input_len : sizeof(buf);
     uint32_t layout = devices[n].info.layout;
-    int pending = 0;
+    int pending = 0, completed = 0;
+    const int timing_enabled = ctx->hid_timing_enabled; /* fixed for this input worker */
     DWORD read_error = ov.hEvent ? ERROR_SUCCESS : GetLastError();
     while(ov.hEvent) {
-        if(!controller_selection_matches(ctx, index, generation)) break;
         if(!pending) {
             DWORD got = 0;
-            ResetEvent(ov.hEvent);
-            if(!ReadFile(h, buf, len, &got, &ov) && GetLastError() != ERROR_IO_PENDING) {
+            /* ReadFile resets its OVERLAPPED event itself before starting I/O. */
+            completed = ReadFile(h, buf, len, &got, &ov);
+            if(!completed && GetLastError() != ERROR_IO_PENDING) {
                 read_error = GetLastError(); break;
             }
             pending = 1;
         }
-        HANDLE waits[] = {ctx->input_stop, ov.hEvent};
-        DWORD waited = WaitForMultipleObjects(2, waits, FALSE, HID_IDLE_CHECK_MS);
-        if(waited == WAIT_OBJECT_0) break;
-        EnterCriticalSection(&ctx->lock);
-        uint32_t special = ctx->special;
-        LeaveCriticalSection(&ctx->lock);
-        if(!controller_selection_matches(ctx, index, generation)) break;
-        if(waited == WAIT_FAILED) { read_error = GetLastError(); break; }
-        if(waited != WAIT_OBJECT_0 + 1) continue; /* nothing arrived yet; keep the read pending */
+        if(!completed) {
+            HANDLE waits[] = {ctx->input_stop, ov.hEvent};
+            DWORD waited = WaitForMultipleObjects(2, waits, FALSE, HID_IDLE_CHECK_MS);
+            if(waited == WAIT_OBJECT_0) break;
+            if(waited == WAIT_FAILED) { read_error = GetLastError(); break; }
+            if(waited != WAIT_OBJECT_0 + 1) {
+                if(!controller_selection_matches(ctx, index, generation)) break;
+                continue; /* timeout is a selection check, not a sampling interval */
+            }
+        }
         DWORD got = 0;
         if(!GetOverlappedResult(h, &ov, &got, FALSE)) { read_error = GetLastError(); break; }
         pending = 0;
-        LARGE_INTEGER captured;
-        QueryPerformanceCounter(&captured);
+        /* Starts after the report is retrieved. It is not a USB/IRQ timestamp. */
+        uint64_t diagnostic_read = ctx->diagnostics ? input_diagnostic_clock() : 0;
+        LARGE_INTEGER captured = {0};
+        if(timing_enabled) QueryPerformanceCounter(&captured);
         ChiakiControllerState state;
         int parsed = hid_parse_report(layout, buf, got, &state);
-        /* Re-post the read before submitting anything. Parsing has already copied the
-         * report into state, so the driver may own buf again; from here the next report
-         * is captured while this one is still being encrypted and sent, instead of
-         * waiting for a fresh driver round-trip after the send completes. */
+        /* Parsing copied the report; re-arm before locking or sending. If it fails, still
+         * submit this completed report before the disconnect neutral below. */
         {
             DWORD next = 0;
-            ResetEvent(ov.hEvent);
-            if(!ReadFile(h, buf, len, &next, &ov)) {
+            completed = ReadFile(h, buf, len, &next, &ov);
+            if(!completed) {
                 DWORD post_error = GetLastError();
-                if(post_error != ERROR_IO_PENDING) { read_error = post_error; break; }
+                if(post_error != ERROR_IO_PENDING) read_error = post_error;
             }
-            pending = 1;
+            pending = read_error == ERROR_SUCCESS;
         }
-        if(!parsed) continue;
-        if(special & PB_BUTTON_PS) state.buttons |= CHIAKI_CONTROLLER_BUTTON_PS;
-        if(special & PB_BUTTON_TOUCHPAD) state.buttons |= CHIAKI_CONTROLLER_BUTTON_TOUCHPAD;
-        EnterCriticalSection(&ctx->lock);
-        if(controller_selection_matches(ctx, index, generation)) {
-            process_sample(ctx, t, index, 1, &state, captured.QuadPart);
-            controller_status_set(ctx, generation, PB_CONTROLLER_READY, 0);
+        /* All production stop sources set stopping before signaling input_stop.
+         * Checking under the submission lock also covers synchronous reads,
+         * without a second kernel wait on every asynchronous completion. */
+        input_lock(ctx, ID_HID_SUBMIT_WAIT);
+        int selected = ctx->status.controller_index == index && ctx->controller_generation == generation && !ctx->stopping;
+        if(selected && parsed) {
+            if(ctx->special & PB_BUTTON_PS) state.buttons |= CHIAKI_CONTROLLER_BUTTON_PS;
+            if(ctx->special & PB_BUTTON_TOUCHPAD) state.buttons |= CHIAKI_CONTROLLER_BUTTON_TOUCHPAD;
+            int submitted = process_sample(ctx, t, index, 1, &state, captured.QuadPart);
+            if(ctx->diagnostics && submitted && ctx->status.state == PB_CONNECTED)
+                input_diagnostic_record(ctx->diagnostics, ID_HID_READ_SUBMIT, diagnostic_read, input_diagnostic_clock());
+            ctx->controller_status = (pb_controller_status){PB_CONTROLLER_READY, 0};
         }
         LeaveCriticalSection(&ctx->lock);
+        if(!selected || read_error != ERROR_SUCCESS) break;
     }
     if(pending) {
         DWORD got = 0;
@@ -746,7 +840,8 @@ static void record_xinput_read(pb_context *ctx, const XINPUT_STATE *input, DWORD
     pb_input_health *health = &ctx->input_health;
     health->read_count++;
     health->read_error = error;
-    health->last_read_duration_us = (double)(completed - started) * 1000000.0 / (double)frequency;
+    (void)frequency;
+    ctx->input_read_duration_ticks = completed - started;
     ctx->input_read_completed = completed;
     if(error != ERROR_SUCCESS) { health->read_failures++; return; }
     if(!ctx->input_packet_changed || health->packet_number != input->dwPacketNumber) {
@@ -776,12 +871,13 @@ static DWORD WINAPI input_worker(LPVOID arg) {
     HANDLE watchdog_thread = CreateThread(NULL, 0, input_watchdog_worker, &watchdog, 0, NULL);
     if(!watchdog_thread) {
         EnterCriticalSection(&ctx->lock);
+        ctx->stopping = 1;
         message_locked(ctx, PB_ERROR, PB_FAILED, "Could not start input safety monitoring.");
         LeaveCriticalSection(&ctx->lock);
         SetEvent(ctx->input_stop);
     }
     while(WaitForSingleObject(ctx->input_stop, 0) != WAIT_OBJECT_0) {
-        EnterCriticalSection(&ctx->lock);
+        input_lock(ctx, ID_XINPUT_SELECT_WAIT);
         uint32_t index = ctx->status.controller_index, special = ctx->special, poll_us = ctx->poll_us;
         uint32_t back_mapping = ctx->back_mapping;
         uint64_t generation = ctx->controller_generation;
@@ -801,7 +897,7 @@ static DWORD WINAPI input_worker(LPVOID arg) {
         XINPUT_STATE input = {0};
         LARGE_INTEGER read_started;
         QueryPerformanceCounter(&read_started);
-        EnterCriticalSection(&ctx->lock);
+        input_lock(ctx, ID_XINPUT_READ_WAIT);
         ctx->input_read_started = read_started.QuadPart;
         ctx->input_read_generation = generation;
         ctx->input_read_pending = 1;
@@ -811,7 +907,7 @@ static DWORD WINAPI input_worker(LPVOID arg) {
         int present = input_error == ERROR_SUCCESS;
         LARGE_INTEGER captured;
         QueryPerformanceCounter(&captured);
-        EnterCriticalSection(&ctx->lock);
+        input_lock(ctx, ID_XINPUT_SUBMIT_WAIT);
         ctx->input_read_pending = 0;
         if(WaitForSingleObject(ctx->input_stop, 0) == WAIT_OBJECT_0) {
             LeaveCriticalSection(&ctx->lock);
@@ -855,6 +951,9 @@ static DWORD WINAPI input_worker(LPVOID arg) {
     chiaki_controller_state_set_idle(&idle);
     if(watchdog_thread) { WaitForSingleObject(watchdog_thread, INFINITE); CloseHandle(watchdog_thread); }
     chiaki_session_set_controller_state(&ctx->session,&idle);
+    EnterCriticalSection(&ctx->lock);
+    stats_publish_locked(ctx, 0, 0, 1);
+    LeaveCriticalSection(&ctx->lock);
     if(timer) { CancelWaitableTimer(timer); CloseHandle(timer); }
     if(fallback) timeEndPeriod(1);
     if(mmcss) mmcss_leave(mmcss);
@@ -902,6 +1001,7 @@ static void session_event(ChiakiEvent *event, void *arg) {
             ctx->login_serial++;
             message_locked(ctx,PB_LOGIN_PIN,0,event->login_pin_request.pin_incorrect ? "Console login PIN incorrect." : "Console login PIN required."); break;
         case CHIAKI_EVENT_QUIT:
+            ctx->stopping = 1;
             message_locked(ctx,event->quit.reason==CHIAKI_QUIT_REASON_STOPPED ? PB_STOPPED : PB_ERROR,
                 event->quit.reason,chiaki_quit_reason_string(event->quit.reason));
             if(ctx->input_stop) SetEvent(ctx->input_stop);
@@ -936,6 +1036,10 @@ pb_context *PB_CALL pb_create(void) {
     if(!ctx) return NULL;
     InitializeCriticalSection(&ctx->lock);
     InitializeCriticalSection(&ctx->operation);
+    stats_ensure_initialized(ctx);
+    ctx->xinput_timing_enabled = environment_enabled(L"PS5BRIDGE_XINPUT_TIMING")
+        || environment_enabled(L"PS5BRIDGE_TRACE");
+    ctx->diagnostics = input_diagnostics_create();
     ctx->poll_us = 500;
     chiaki_log_init(&ctx->log,0,NULL,NULL);
     ctx->input_stop = CreateEventW(NULL,TRUE,FALSE,NULL);
@@ -951,6 +1055,7 @@ void PB_CALL pb_destroy(pb_context *ctx) {
     SecureZeroMemory(&ctx->registered,sizeof(ctx->registered));
     DeleteCriticalSection(&ctx->lock);
     DeleteCriticalSection(&ctx->operation);
+    if(ctx->stats_initialized) DeleteCriticalSection(&ctx->stats_lock);
     free(ctx);
 }
 int32_t PB_CALL pb_register(pb_context *ctx, const char *host, const uint8_t account_id[8], uint32_t pin,
@@ -1038,12 +1143,11 @@ static int32_t start_device(pb_context *ctx, const char *host, const pb_credenti
     ctx->controller_status = (pb_controller_status){PB_CONTROLLER_WAITING, 0};
     ctx->status.controller_present = 0;
     ctx->status.input_reports = ctx->status.input_samples = 0;
-    memset(&ctx->timing,0,sizeof(ctx->timing)); ctx->timing_sum = 0;
-    memset(&ctx->submit_latency,0,sizeof(ctx->submit_latency));
-    memset(&ctx->sample_intervals,0,sizeof(ctx->sample_intervals));
     memset(&ctx->input_debug,0,sizeof(ctx->input_debug)); ctx->login_serial = 0;
+    stats_reset_locked(ctx);
     memset(&ctx->input_health, 0, sizeof(ctx->input_health));
     ctx->input_read_started = ctx->input_read_completed = ctx->input_packet_changed = 0;
+    ctx->input_read_duration_ticks = 0;
     ctx->input_read_pending = ctx->input_read_timed_out = 0;
     ctx->stopping = 0; ctx->special = 0;
     message_locked(ctx,PB_CONNECTING,0,"Connecting to PS5 on the local network.");
@@ -1054,9 +1158,17 @@ static int32_t start_device(pb_context *ctx, const char *host, const pb_credenti
         ctx->trace = calloc(TRACE_CAPACITY, sizeof(trace_entry));
         ctx->trace_len = 0;
     }
+    EnterCriticalSection(&ctx->lock);
+    ctx->hid_timing_enabled = ctx->trace != NULL;
+    ctx->xinput_timing_enabled = environment_enabled(L"PS5BRIDGE_XINPUT_TIMING") || ctx->trace != NULL;
+    LeaveCriticalSection(&ctx->lock);
+    /* pb_create may have prepared an unused recorder; no worker has run for
+     * this session yet. Refresh options without emitting an empty CSV. */
+    free(ctx->diagnostics);
+    ctx->diagnostics = input_diagnostics_create();
     error = chiaki_session_start(&ctx->session);
     if(error==CHIAKI_ERR_SUCCESS) {
-        /* 1 ms scheduler tick so the feedback worker's 2 ms loss-recovery repeat is on time. */
+        /* 1 ms scheduler tick for upstream's 20/50/100/200 ms history tail resends. */
         timeBeginPeriod(1);
         ctx->session_started = 1;
         ctx->input_thread = CreateThread(NULL,0,input_worker,ctx,0,NULL);
@@ -1097,13 +1209,15 @@ int32_t PB_CALL pb_stop(pb_context *ctx) {
         CloseHandle(ctx->input_thread); ctx->input_thread = NULL;
     }
     trace_write(ctx);
+    input_diagnostics_write_free(ctx->diagnostics);
+    ctx->diagnostics = NULL;
     if(ctx->session_initialized) {
         ChiakiControllerState idle;
         chiaki_controller_state_set_idle(&idle);
         chiaki_session_set_controller_state(&ctx->session,&idle);
-        /* The release is sent synchronously; allow its loss-recovery repeat to go out. */
+        /* The release is sent synchronously; allow the first 20 ms tail resend to go out. */
         if(ctx->session_started) {
-            Sleep(10); chiaki_session_stop(&ctx->session); chiaki_session_join(&ctx->session);
+            Sleep(30); chiaki_session_stop(&ctx->session); chiaki_session_join(&ctx->session);
             timeEndPeriod(1);
         }
         chiaki_session_fini(&ctx->session);
@@ -1125,7 +1239,12 @@ int32_t PB_CALL pb_get_status(pb_context *ctx, pb_status *result) {
 }
 int32_t PB_CALL pb_get_timing_stats(pb_context *ctx, pb_timing_stats *result) {
     if(!ctx || !result) return PB_INVALID;
-    EnterCriticalSection(&ctx->lock); *result = ctx->timing; LeaveCriticalSection(&ctx->lock); return PB_OK;
+    stats_ensure_initialized(ctx);
+    EnterCriticalSection(&ctx->stats_lock);
+    *result = ctx->published_revision == InterlockedCompareExchange64(&ctx->stats_revision, 0, 0)
+        ? ctx->published_timing : (pb_timing_stats){0};
+    LeaveCriticalSection(&ctx->stats_lock);
+    return PB_OK;
 }
 int32_t PB_CALL pb_get_input_health(pb_context *ctx, pb_input_health *result) {
     if(!ctx || !result) return PB_INVALID;
@@ -1134,6 +1253,7 @@ int32_t PB_CALL pb_get_input_health(pb_context *ctx, pb_input_health *result) {
     EnterCriticalSection(&ctx->lock);
     QueryPerformanceCounter(&now);
     *result = ctx->input_health;
+    result->last_read_duration_us = (double)ctx->input_read_duration_ticks * 1000000.0 / (double)frequency.QuadPart;
     result->last_read_age_ms = ctx->input_read_completed
         ? (double)(now.QuadPart - ctx->input_read_completed) * 1000.0 / (double)frequency.QuadPart : -1;
     result->last_change_age_ms = ctx->input_packet_changed
@@ -1145,12 +1265,17 @@ int32_t PB_CALL pb_get_latency_stats(pb_context *ctx, pb_latency_stats *result) 
     if(!ctx || !result) return PB_INVALID;
     double submissions[LATENCY_WINDOW], intervals[LATENCY_WINDOW];
     memset(result, 0, sizeof(*result));
-    EnterCriticalSection(&ctx->lock);
-    uint32_t ns = ctx->submit_latency.count, ni = ctx->sample_intervals.count;
-    memcpy(submissions, ctx->submit_latency.values, ns * sizeof(double));
-    memcpy(intervals, ctx->sample_intervals.values, ni * sizeof(double));
-    result->submit_failures = ctx->input_debug.submit_failures;
-    LeaveCriticalSection(&ctx->lock);
+    result->submit_failures = (uint64_t)InterlockedCompareExchange64(&ctx->stats_failures, 0, 0);
+    stats_ensure_initialized(ctx);
+    EnterCriticalSection(&ctx->stats_lock);
+    if(ctx->published_revision != InterlockedCompareExchange64(&ctx->stats_revision, 0, 0)) {
+        LeaveCriticalSection(&ctx->stats_lock);
+        return PB_OK;
+    }
+    uint32_t ns = ctx->published_submits.count, ni = ctx->published_intervals.count;
+    memcpy(submissions, ctx->published_submits.values, ns * sizeof(double));
+    memcpy(intervals, ctx->published_intervals.values, ni * sizeof(double));
+    LeaveCriticalSection(&ctx->stats_lock);
     /* Snapshot reads must never sort or allocate while holding the sampling lock. */
     qsort(submissions, ns, sizeof(double), latency_compare);
     qsort(intervals, ni, sizeof(double), latency_compare);

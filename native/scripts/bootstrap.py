@@ -6,7 +6,9 @@ ROOT = Path(__file__).resolve().parents[2]
 DEPS = ROOT / 'native' / '.deps'
 DEPS.mkdir(parents=True, exist_ok=True)
 CHIAKI = ROOT / 'third_party' / 'chiaki' / 'source'
-PIN = '0c4a45df0cae2af2ba2daef84e881850b07038a3'
+# chiaki-ng main after #823/#838/#840 (feedback history: one event per packet,
+# tail resends, event count in the header). Submodule pins below are unchanged.
+PIN = 'c8bea2642d0e95402f373af55584a3b98cd89417'
 SOURCES = [
  ('chiaki', f'https://codeload.github.com/chiaki-ng/chiaki-ng/tar.gz/{PIN}', CHIAKI),
  ('nanopb', 'https://codeload.github.com/nanopb/nanopb/tar.gz/cad3c18ef15a663e30e3e43e3a752b66378adec1', CHIAKI/'third-party/nanopb'),
@@ -41,8 +43,13 @@ def download(url, dest, sha=None):
 
 def source(item):
     name, url, dest = item
-    if (dest/'.bridge-source-ready').exists(): return
-    archive = download(url, DEPS/f'{name}.tar.gz')
+    marker = dest/'.bridge-source-ready'
+    if marker.exists() and marker.read_text(encoding='utf-8') == url: return
+    # A tree from another pin (or a half-finished copy) is discarded, never patched over.
+    # The chiaki root is extracted first, so removing it also drops its old submodule copies.
+    if dest.exists(): shutil.rmtree(dest)
+    # Archives are cached per URL: changing a pin must never reuse the old download.
+    archive = download(url, DEPS/f'{name}-{hashlib.sha256(url.encode()).hexdigest()[:12]}.tar.gz')
     stage = DEPS/f'extract-{name}'
     stage.mkdir(exist_ok=True)
     with tarfile.open(archive) as arc:
@@ -50,22 +57,22 @@ def source(item):
     children = list(stage.iterdir())
     if len(children) != 1: raise RuntimeError(f'Unexpected archive layout: {name}')
     dest.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(children[0], dest, dirs_exist_ok=True)
+    # chiaki-ng's Switch resources symlink into a submodule this build never fetches.
+    shutil.copytree(children[0], dest, dirs_exist_ok=True, ignore_dangling_symlinks=True)
+    # Upstream tar timestamps can predate cached object files from a previous pin.
+    # Touch new sources so incremental builds cannot silently link the old protocol.
+    for extracted in dest.rglob('*'):
+        if extracted.is_file(): extracted.touch()
     (dest/'.bridge-source-ready').write_text(url, encoding='utf-8')
     shutil.rmtree(stage)
 
-PATCHES = ROOT / 'native' / 'patches' / 'chiaki'
-
 def apply_patches():
-    # Whole-file replacements of pinned upstream sources; reapplied every run.
-    for patched in PATCHES.rglob('*'):
-        if patched.is_file():
-            target = CHIAKI / patched.relative_to(PATCHES)
-            if not target.exists(): raise RuntimeError(f'Patch target missing: {target}')
-            shutil.copyfile(patched, target)
-    # Small checked edits to pinned upstream files; fail closed if the baseline drifts.
-    edits = json.loads((ROOT/'native/patches/chiaki-return-errors.json').read_text(encoding='utf-8'))
+    # Only small checked edits to the pinned upstream files, never whole-file replacements,
+    # so a newer upstream pin shows exactly which edit no longer fits. Fail closed on drift.
+    edits = json.loads((ROOT/'native/patches/chiaki-edits.json').read_text(encoding='utf-8'))
     apply_checked_edits(CHIAKI, edits)
+    for name in ('chiaki-low-latency.json',):
+        apply_checked_edits(CHIAKI, json.loads((ROOT/'native/patches'/name).read_text(encoding='utf-8')))
 
 def apply_checked_edits(root, edits):
     for edit in edits:
